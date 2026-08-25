@@ -16,7 +16,7 @@ time series (B, C, T)
 
 ```bash
 pip install -r requirements.txt      # or: pip install -e .
-pytest -q                            # 79 tests (GPU ones auto-skip on CPU)
+pytest -q                            # 84 tests (GPU ones auto-skip on CPU)
 ```
 
 Start with **`notebooks/demo_timeseries_transformer.ipynb`** — it runs the whole
