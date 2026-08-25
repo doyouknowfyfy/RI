@@ -1,0 +1,7 @@
+torch>=2.1
+numpy>=1.23
+pandas>=1.5
+# optional, used by the demo notebook and some tests
+matplotlib>=3.6
+scikit-learn>=1.1
+pytest>=7.0

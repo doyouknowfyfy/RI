@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tsfm"
+version = "0.1.0"
+description = "Conv1d-tokenised transformer for multivariate time-series regression with missing-aware embeddings and late snapshot fusion"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.1", "numpy>=1.23", "pandas>=1.5"]
+
+[project.optional-dependencies]
+demo = ["matplotlib>=3.6", "jupyter", "scikit-learn>=1.1"]
+dev = ["pytest>=7.0", "scikit-learn>=1.1"]
+
+[tool.setuptools.packages.find]
+include = ["tsfm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::UserWarning"]
