@@ -1,0 +1,9 @@
+# GPU stack (RAPIDS): install via conda/pip per https://docs.rapids.ai/install
+#   cudf / dask-cudf / dask-cuda matching your CUDA version
+xgboost>=2.1
+dask[dataframe,distributed]
+optuna>=3.1
+pandas
+numpy
+pyarrow
+matplotlib

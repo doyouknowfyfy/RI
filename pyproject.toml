@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xgb-optuna-gpu"
+version = "0.1.0"
+description = "Distributed GPU XGBoost regression with resumable Optuna multi-objective tuning"
+requires-python = ">=3.10"
+dependencies = ["xgboost>=2.1", "dask[dataframe,distributed]", "optuna>=3.1", "pandas", "numpy", "pyarrow"]
+
+[project.optional-dependencies]
+dev = ["pytest", "matplotlib"]
+
+[tool.setuptools]
+packages = ["xgb_optuna_gpu"]
