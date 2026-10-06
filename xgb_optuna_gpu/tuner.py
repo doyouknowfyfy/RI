@@ -17,6 +17,7 @@ from optuna.trial import FrozenTrial, TrialState
 
 from .data import build_dmatrices
 from .losses import LossSpec, SpaceEntry, get_loss
+from .storage import SyncedSQLiteStorage, is_fuse_path, normalize_path
 from .trainer import DEFAULT_EVAL_METRICS, TrainResult, overfit_index, train_xgb_model
 
 DEFAULT_SEARCH_SPACE: dict[str, SpaceEntry] = {
@@ -77,6 +78,14 @@ class XGBOptunaTuner:
     ``(X_train, y_train, X_valid, y_valid)`` Dask collections. It is called lazily, and
     again after a cluster restart (a restart wipes all data held by the workers).
     Assumes a single process drives a given study at a time.
+
+    Storage:
+      * ``storage`` given (e.g. ``"postgresql://..."`` or an Optuna storage object): used as is.
+      * otherwise SQLite. If ``output_dir`` is on a Databricks FUSE mount (``/dbfs``,
+        ``/Volumes``, ``/Workspace``; SQLite fails there with "disk I/O error"), or
+        ``sync_db=True``, the live DB sits in ``local_db_dir`` (default
+        ``/local_disk0/tmp/optuna_local_db``) and ``<study_dir>/study.db`` is a snapshot
+        refreshed after every trial and restored on the next run.
     """
 
     def __init__(
@@ -102,14 +111,27 @@ class XGBOptunaTuner:
         enable_categorical: bool = False,
         max_overfit: float | None = None,
         verbose: bool = True,
+        storage: str | optuna.storages.BaseStorage | None = None,
+        sync_db: bool | None = None,
+        local_db_dir: str | Path | None = None,
     ):
         self.client = client
         self.data_loader = data_loader
         self.loss = get_loss(loss) if isinstance(loss, str) else loss
         self.study_name = study_name or f"xgb_{self.loss.name}"
-        self.study_dir = Path(output_dir) / self.study_name
+        self.study_dir = normalize_path(output_dir) / self.study_name
         self.study_dir.mkdir(parents=True, exist_ok=True)
-        self.storage_url = f"sqlite:///{(self.study_dir / 'study.db').resolve()}"
+
+        self._synced: SyncedSQLiteStorage | None = None
+        if storage is not None:
+            self.storage = storage
+        elif sync_db or (sync_db is None and is_fuse_path(self.study_dir)):
+            self._synced = SyncedSQLiteStorage(self.study_dir / "study.db", local_db_dir)
+            self.storage = self._synced.url
+        else:
+            self.storage = f"sqlite:///{(self.study_dir / 'study.db').resolve()}"
+        # URL (or storage object) to pass to optuna.load_study for this study.
+        self.storage_url = self.storage
 
         space = dict(DEFAULT_SEARCH_SPACE if search_space is None else search_space)
         for name, entry in self.loss.extra_space.items():
@@ -166,7 +188,7 @@ class XGBOptunaTuner:
     def load_study(self) -> optuna.Study:
         study = optuna.create_study(
             study_name=self.study_name,
-            storage=self.storage_url,
+            storage=self.storage,
             directions=["minimize", "minimize"],
             load_if_exists=True,
         )
@@ -181,7 +203,16 @@ class XGBOptunaTuner:
         study.set_metric_names([self.opt_metric or "loss_metric", "overfit_index"])
         study.sampler = self._make_sampler(len(study.trials))
         self.study = study
+        self.sync_storage()
         return study
+
+    def sync_storage(self) -> None:
+        """Copy the local SQLite DB to the persistent path (no-op unless syncing)."""
+        if self._synced is not None:
+            try:
+                self._synced.backup()
+            except OSError as e:  # never lose a trial because the backup copy failed
+                self._log(f"[warn] could not back up study DB to {self._synced.persistent_path}: {e}")
 
     def _recover(self, study: optuna.Study, max_retries_per_trial: int) -> None:
         """Fail trials left RUNNING by a crash and re-queue failed trials' params."""
@@ -222,6 +253,7 @@ class XGBOptunaTuner:
 
     def _objective(self, trial: optuna.Trial) -> tuple[float, float]:
         params = self._suggest(trial)
+        self.sync_storage()  # persist the RUNNING trial's params so a crash can retry them
         (X_tr, y_tr, X_va, y_va), (dtrain, dvalid) = self._ensure_data()
         trial_dir = self.study_dir / "trials" / f"trial_{trial.number:05d}"
         trial.set_user_attr("artifact_dir", str(trial_dir))
@@ -259,6 +291,7 @@ class XGBOptunaTuner:
 
     def _after_trial(self, study: optuna.Study, trial: FrozenTrial) -> None:
         """Runs after every trial: persist a CSV snapshot and log progress."""
+        self.sync_storage()
         study.trials_dataframe().to_csv(self.study_dir / "trials.csv", index=False)
         if trial.state == TrialState.COMPLETE:
             best = select_best_trial(study, self.max_overfit)
@@ -292,7 +325,9 @@ class XGBOptunaTuner:
         """
         study = self.load_study()
         self._recover(study, max_retries_per_trial)
-        self._log(f"[study {self.study_name}] {self.n_complete(study)}/{n_trials} trials complete; storage={self.storage_url}")
+        self.sync_storage()
+        where = f"{self.storage} -> synced to {self._synced.persistent_path}" if self._synced else self.storage
+        self._log(f"[study {self.study_name}] {self.n_complete(study)}/{n_trials} trials complete; storage={where}")
 
         restarts = 0
         while (remaining := n_trials - self.n_complete(study)) > 0:
@@ -304,10 +339,12 @@ class XGBOptunaTuner:
                     gc_after_trial=True,
                 )
             except KeyboardInterrupt:
+                self.sync_storage()
                 self._log("Interrupted by user; progress is saved. Re-run optimize() to resume.")
                 raise
             except Exception as e:  # GPU / worker failures
                 restarts += 1
+                self.sync_storage()
                 self._log(f"[error] {type(e).__name__}: {e} (restart {restarts}/{max_restarts})")
                 if restarts > max_restarts:
                     raise
@@ -315,6 +352,7 @@ class XGBOptunaTuner:
                     self.client.restart()
                 self._reset_data()
                 self._recover(study, max_retries_per_trial)
+                self.sync_storage()
                 continue
             if n_trials - self.n_complete(study) >= remaining:  # nothing completed (all NaN)
                 self._log("[warn] no trial completed in the last batch; stopping.")

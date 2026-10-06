@@ -89,3 +89,31 @@ def test_resume_after_crash_and_gpu_error(client, loader, tmp_path, monkeypatch)
     retried = next(tr for tr in trials if tr.user_attrs.get("retry_of") == failed[0].number)
     assert retried.params == failed[0].params
     json.loads((t2.study_dir / "trials" / f"trial_{retried.number:05d}" / "metrics.json").read_text())
+
+
+def test_fuse_path_detection():
+    from xgb_optuna_gpu.storage import is_fuse_path, normalize_path
+
+    assert is_fuse_path("/dbfs/tmp/x") and is_fuse_path("dbfs:/tmp/x")
+    assert is_fuse_path("/Volumes/cat/schema/vol/runs") and is_fuse_path("/Workspace/Users/a/runs")
+    assert not is_fuse_path("/local_disk0/tmp") and not is_fuse_path("/dbfsx/a")
+    assert str(normalize_path("dbfs:/a/b")) == "/dbfs/a/b"
+
+
+def test_synced_sqlite_resume(client, loader, tmp_path):
+    """Simulates Databricks: live DB on local disk, snapshot in output_dir, local disk wiped."""
+    out, local = tmp_path / "volume", tmp_path / "local_disk"
+    t = _tuner(client, loader, out, "mse", sync_db=True, local_db_dir=local)
+    assert str(local) in t.storage_url
+    t.optimize(n_trials=2)
+
+    snapshot = t.study_dir / "study.db"
+    assert snapshot.exists()
+    assert len(optuna.load_study(study_name=t.study_name, storage=f"sqlite:///{snapshot}").trials) == 2
+
+    for f in local.iterdir():  # cluster restart wipes the driver's local disk
+        f.unlink()
+    t2 = _tuner(client, loader, out, "mse", sync_db=True, local_db_dir=local)
+    t2.optimize(n_trials=3)
+    assert t2.n_complete() == 3
+    assert len(optuna.load_study(study_name=t.study_name, storage=f"sqlite:///{snapshot}").trials) == 3

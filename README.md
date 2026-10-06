@@ -11,9 +11,10 @@ xgb_optuna_gpu/
 ├── data.py      load_dask_data() -> dask_cudf collections; build_dmatrices() -> DaskQuantileDMatrix
 ├── losses.py    MSE / pseudo-Huber / Tweedie specs (objective, loss metric, extra tunables)
 ├── trainer.py   train_xgb_model(): one dask.xgboost run + early stopping + saved booster/metrics
+├── storage.py   SyncedSQLiteStorage: local SQLite mirrored to /dbfs or /Volumes (Databricks)
 └── tuner.py     XGBOptunaTuner: TPE multi-objective study, resume, best-model report
 notebooks/demo_xgb_optuna_gpu.ipynb   end-to-end demo
-tests/test_smoke.py                   CPU tests (losses, resume after crash / GPU error)
+tests/test_smoke.py                   CPU tests (losses, resume after crash / GPU error, synced SQLite)
 ```
 
 ## What it does
@@ -29,7 +30,7 @@ tests/test_smoke.py                   CPU tests (losses, resume after crash / GP
 | Tuned | `max_depth, learning_rate, gamma, min_child_weight, max_delta_step, reg_alpha, reg_lambda` (ranges in `tuner.DEFAULT_SEARCH_SPACE`) |
 | Sampler | `TPESampler(n_startup_trials=..., gamma=min(ceil(fraction*n), max))` |
 | Objectives | minimise (1) valid loss metric, (2) overfit index `|valid - train| / |train|` on the same metric |
-| Persistence | SQLite study committed after each trial + `trials.csv` snapshot; re-run resumes |
+| Persistence | SQLite study committed after each trial + `trials.csv` snapshot; re-run resumes (on Databricks FUSE paths the DB runs on local disk and is copied over) |
 | Best model | lowest loss on the Pareto front with overfit ≤ `max_overfit` (otherwise lowest loss) |
 
 ## Quick start
@@ -56,6 +57,25 @@ tuner.optimize(n_trials=100)   # prints the best model's metrics at the end
   marked failed and its params re-queued, and only the remaining trials run.
 
 Only one process should drive a given study at a time.
+
+### Databricks: `sqlite3.OperationalError: disk I/O error`
+
+SQLite needs file locking and random writes, and Databricks FUSE mounts (`/dbfs`, `/Volumes`,
+`/Workspace`) support neither. When `output_dir` is on one of them, the tuner automatically:
+
+1. runs the SQLite DB on the driver's local disk (`local_db_dir`, default `/local_disk0/tmp/optuna_local_db`),
+2. copies a consistent snapshot to `<output_dir>/<study_name>/study.db` at the start and end of every trial,
+3. copies that snapshot back to local disk on the next run (e.g. after a cluster restart), and resumes.
+
+```python
+tuner = XGBOptunaTuner(client, loader, loss="tweedie",
+                       output_dir="/Volumes/main/ml/artifacts/optuna_runs")   # auto-synced
+# force it on any path: sync_db=True; choose the local dir: local_db_dir="/local_disk0/tmp/optuna"
+# or use a server DB instead of SQLite: storage="postgresql://user:pw@host/db"
+```
+
+To open the study elsewhere, copy `study.db` to local disk first, then use
+`optuna.load_study(study_name=..., storage="sqlite:////local_disk0/tmp/study.db")`.
 
 ## Notes
 
