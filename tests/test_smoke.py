@@ -104,7 +104,7 @@ def test_synced_sqlite_resume(client, loader, tmp_path):
     """Simulates Databricks: live DB on local disk, snapshot in output_dir, local disk wiped."""
     out, local = tmp_path / "volume", tmp_path / "local_disk"
     t = _tuner(client, loader, out, "mse", sync_db=True, local_db_dir=local)
-    assert str(local) in t.storage_url
+    assert str(local) in t.storage_url and t.local_db == local / f"{t.study_name}.db"
     t.optimize(n_trials=2)
 
     snapshot = t.study_dir / "study.db"
@@ -117,3 +117,27 @@ def test_synced_sqlite_resume(client, loader, tmp_path):
     t2.optimize(n_trials=3)
     assert t2.n_complete() == 3
     assert len(optuna.load_study(study_name=t.study_name, storage=f"sqlite:///{snapshot}").trials) == 3
+
+
+def test_load_study_from_volume(tmp_path):
+    """Standalone helper: volume copy -> local disk, interrupted trial marked FAIL + retried."""
+    from xgb_optuna_gpu import load_study_from_volume, save_study_to_volume
+
+    volume_db, local_db = tmp_path / "volume" / "study.db", tmp_path / "local" / "study.db"
+    local_db.parent.mkdir()
+    study = optuna.create_study(study_name="s", storage=f"sqlite:///{local_db}", directions=["minimize"] * 2)
+    objective = lambda tr: (tr.suggest_float("x", 0, 1), tr.suggest_float("y", 0, 1))
+    study.optimize(objective, n_trials=3)
+    crashed = study.ask()
+    crashed.suggest_float("x", 0, 1)
+    save_study_to_volume(local_db, volume_db)
+    local_db.unlink()  # cluster restart
+
+    study, local = load_study_from_volume("s", volume_db, local_db)
+    assert local == local_db and local_db.exists()
+    assert study.trials[crashed.number].state == TrialState.FAIL
+    study.optimize(objective, n_trials=1, callbacks=[lambda st, tr: save_study_to_volume(local, volume_db)])
+    retry = study.trials[-1]
+    assert retry.state == TrialState.COMPLETE and retry.params["x"] == crashed.params["x"]
+    saved = optuna.load_study(study_name="s", storage=f"sqlite:///{volume_db}")
+    assert len(saved.trials) == 5

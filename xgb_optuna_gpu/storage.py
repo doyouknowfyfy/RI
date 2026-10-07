@@ -1,22 +1,22 @@
-"""Optuna storage that works on Databricks (and other FUSE / network file systems).
+"""Keep the Optuna SQLite study on local disk and copy it to/from a Databricks volume.
 
-SQLite needs POSIX file locking and random writes. Databricks FUSE mounts (``/dbfs``,
-``/Volumes``, ``/Workspace``) support neither, so ``create_study(storage="sqlite:////dbfs/...")``
-fails with ``sqlite3.OperationalError: disk I/O error``.
+SQLite needs file locking and random writes, which Databricks FUSE mounts (``/Volumes``,
+``/dbfs``, ``/Workspace``) do not support, so a ``sqlite:////Volumes/...`` storage fails
+with ``disk I/O error``. The simple fix:
 
-``SyncedSQLiteStorage`` keeps the live database on the driver's local disk and copies a
-consistent snapshot to the persistent path after every trial. When the cluster restarts
-(local disk wiped), the snapshot is copied back and the study resumes.
+1. before the study is opened, copy ``study.db`` from the volume to ``/local_disk0``;
+2. run Optuna on the local file;
+3. after every trial, ``shutil.copy`` the local file back to the volume.
 """
 
 from __future__ import annotations
 
-import hashlib
-import os
 import shutil
-import sqlite3
 import tempfile
 from pathlib import Path
+
+import optuna
+from optuna.trial import TrialState
 
 FUSE_PREFIXES = ("/dbfs", "/Volumes", "/Workspace")
 
@@ -36,58 +36,61 @@ def is_fuse_path(path: str | Path) -> bool:
 
 
 def default_local_dir() -> Path:
-    # /local_disk0 is the driver's fast local SSD on Databricks.
+    # /local_disk0 is the driver's local SSD on Databricks.
     base = Path("/local_disk0/tmp") if Path("/local_disk0").is_dir() else Path(tempfile.gettempdir())
-    return base / "optuna_local_db"
+    return base / "optuna"
 
 
-class SyncedSQLiteStorage:
-    """SQLite on local disk, mirrored to ``persistent_path`` with :meth:`backup`.
+def copy_study_to_local(volume_db: str | Path, local_db: str | Path) -> str:
+    """Copy the saved study from the volume to local disk; return the local storage URL.
 
-    The persistent copy is the source of truth: on construction it is restored to local
-    disk if it exists. If it does not exist, any stale local copy is removed so a deleted
-    output directory really means a fresh study.
+    * volume copy exists, local missing or older -> copy volume -> local (resume)
+    * local copy newer (same cluster, not restarted) -> keep local
+    * no volume copy -> delete any leftover local file and start a fresh study
     """
+    volume_db, local_db = normalize_path(volume_db), Path(local_db)
+    local_db.parent.mkdir(parents=True, exist_ok=True)
+    if volume_db.exists():
+        if not local_db.exists() or local_db.stat().st_mtime < volume_db.stat().st_mtime:
+            shutil.copy(volume_db, local_db)
+    elif local_db.exists():
+        local_db.unlink()
+    return f"sqlite:///{local_db.absolute()}"
 
-    def __init__(self, persistent_path: str | Path, local_dir: str | Path | None = None):
-        self.persistent_path = normalize_path(persistent_path)
-        local_dir = Path(local_dir) if local_dir is not None else default_local_dir()
-        local_dir.mkdir(parents=True, exist_ok=True)
-        # Unique per persistent path, so several studies can share the local dir.
-        key = hashlib.sha1(str(self.persistent_path.absolute()).encode()).hexdigest()[:10]
-        self.local_path = local_dir / f"{self.persistent_path.stem}-{key}.db"
-        self.restore()
 
-    @property
-    def url(self) -> str:
-        return f"sqlite:///{self.local_path.absolute()}"
+def save_study_to_volume(local_db: str | Path, volume_db: str | Path) -> None:
+    """Copy the local study DB to the volume (a whole-file copy works on FUSE mounts)."""
+    local_db, volume_db = Path(local_db), normalize_path(volume_db)
+    if local_db.exists():
+        volume_db.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(local_db, volume_db)
 
-    def restore(self) -> None:
-        for suffix in ("", "-journal", "-wal", "-shm"):
-            Path(f"{self.local_path}{suffix}").unlink(missing_ok=True)
-        if self.persistent_path.exists():
-            shutil.copyfile(self.persistent_path, self.local_path)
 
-    def backup(self) -> None:
-        """Copy a consistent snapshot of the local DB to the persistent path."""
-        if not self.local_path.exists():
-            return
-        snapshot = self.local_path.with_suffix(".snapshot")
-        src = sqlite3.connect(self.local_path)
-        dst = sqlite3.connect(snapshot)
-        try:
-            src.backup(dst)  # consistent even while Optuna's engine holds a connection
-        finally:
-            dst.close()
-            src.close()
-        self.persistent_path.parent.mkdir(parents=True, exist_ok=True)
-        # Sequential whole-file write (supported on FUSE), then an atomic rename where possible
-        # so a crash mid-copy never leaves a half-written study.db.
-        tmp = self.persistent_path.with_name(self.persistent_path.name + ".tmp")
-        shutil.copyfile(snapshot, tmp)
-        try:
-            os.replace(tmp, self.persistent_path)
-        except OSError:
-            shutil.copyfile(snapshot, self.persistent_path)
-            tmp.unlink(missing_ok=True)
-        snapshot.unlink(missing_ok=True)
+def load_study_from_volume(
+    study_name: str,
+    volume_db: str | Path,
+    local_db: str | Path | None = None,
+    sampler: optuna.samplers.BaseSampler | None = None,
+    retry_interrupted: bool = True,
+) -> tuple[optuna.Study, Path]:
+    """Copy a saved study from the volume to local disk and load it to continue tuning.
+
+    The sampler is not stored in the DB, so pass it again or set ``study.sampler``
+    afterwards (offset its seed by ``len(study.trials)`` to avoid repeating earlier random
+    trials). Trials left RUNNING by a crashed run are marked FAIL and, if
+    ``retry_interrupted``, their params are re-queued.
+    Returns ``(study, local_db)``; after each trial call
+    ``save_study_to_volume(local_db, volume_db)``.
+    """
+    volume_db = normalize_path(volume_db)
+    if not volume_db.exists():
+        raise FileNotFoundError(f"No saved study at {volume_db}")
+    local_db = Path(local_db) if local_db is not None else default_local_dir() / f"{study_name}.db"
+    storage = copy_study_to_local(volume_db, local_db)
+    study = optuna.load_study(study_name=study_name, storage=storage, sampler=sampler)
+    for t in study.get_trials(deepcopy=False, states=(TrialState.RUNNING,)):
+        # Private API, but the only way to close a trial whose process is gone.
+        study._storage.set_trial_state_values(t._trial_id, state=TrialState.FAIL)
+        if retry_interrupted and t.params:
+            study.enqueue_trial(t.params)  # no skip_if_exists: it would match the failed trial itself
+    return study, local_db

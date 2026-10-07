@@ -11,7 +11,7 @@ xgb_optuna_gpu/
 ├── data.py      load_dask_data() -> dask_cudf collections; build_dmatrices() -> DaskQuantileDMatrix
 ├── losses.py    MSE / pseudo-Huber / Tweedie specs (objective, loss metric, extra tunables)
 ├── trainer.py   train_xgb_model(): one dask.xgboost run + early stopping + saved booster/metrics
-├── storage.py   SyncedSQLiteStorage: local SQLite mirrored to /dbfs or /Volumes (Databricks)
+├── storage.py   copy the study DB between /local_disk0 and a volume (Databricks)
 └── tuner.py     XGBOptunaTuner: TPE multi-objective study, resume, best-model report
 notebooks/demo_xgb_optuna_gpu.ipynb   end-to-end demo
 tests/test_smoke.py                   CPU tests (losses, resume after crash / GPU error, synced SQLite)
@@ -30,7 +30,7 @@ tests/test_smoke.py                   CPU tests (losses, resume after crash / GP
 | Tuned | `max_depth, learning_rate, gamma, min_child_weight, max_delta_step, reg_alpha, reg_lambda` (ranges in `tuner.DEFAULT_SEARCH_SPACE`) |
 | Sampler | `TPESampler(n_startup_trials=..., gamma=min(ceil(fraction*n), max))` |
 | Objectives | minimise (1) valid loss metric, (2) overfit index `|valid - train| / |train|` on the same metric |
-| Persistence | SQLite study committed after each trial + `trials.csv` snapshot; re-run resumes (on Databricks FUSE paths the DB runs on local disk and is copied over) |
+| Persistence | SQLite study committed after each trial + `trials.csv` snapshot; re-run resumes (on Databricks volumes the DB runs on `/local_disk0` and is copied to the volume) |
 | Best model | lowest loss on the Pareto front with overfit ≤ `max_overfit` (otherwise lowest loss) |
 
 ## Quick start
@@ -60,22 +60,40 @@ Only one process should drive a given study at a time.
 
 ### Databricks: `sqlite3.OperationalError: disk I/O error`
 
-SQLite needs file locking and random writes, and Databricks FUSE mounts (`/dbfs`, `/Volumes`,
-`/Workspace`) support neither. When `output_dir` is on one of them, the tuner automatically:
+SQLite needs file locking and random writes, and Databricks FUSE mounts (`/Volumes`, `/dbfs`,
+`/Workspace`) support neither. So the study runs on local disk and only whole-file copies go to the volume:
 
-1. runs the SQLite DB on the driver's local disk (`local_db_dir`, default `/local_disk0/tmp/optuna_local_db`),
-2. copies a consistent snapshot to `<output_dir>/<study_name>/study.db` at the start and end of every trial,
-3. copies that snapshot back to local disk on the next run (e.g. after a cluster restart), and resumes.
+1. creating the tuner copies `<output_dir>/<study_name>/study.db` to `/local_disk0/tmp/optuna/<study_name>.db`
+   (if the volume copy is newer than the local one, or there is no local copy),
+2. Optuna reads and writes only the local file,
+3. the local file is `shutil.copy`-ed back to the volume at the start and end of every trial.
+
+This happens automatically when `output_dir` is on a FUSE mount:
 
 ```python
 tuner = XGBOptunaTuner(client, loader, loss="tweedie",
-                       output_dir="/Volumes/main/ml/artifacts/optuna_runs")   # auto-synced
+                       output_dir="/Volumes/main/ml/artifacts/optuna_runs")
+tuner.optimize(n_trials=100)     # run again after a crash / cluster restart to continue
 # force it on any path: sync_db=True; choose the local dir: local_db_dir="/local_disk0/tmp/optuna"
 # or use a server DB instead of SQLite: storage="postgresql://user:pw@host/db"
 ```
 
-To open the study elsewhere, copy `study.db` to local disk first, then use
-`optuna.load_study(study_name=..., storage="sqlite:////local_disk0/tmp/study.db")`.
+To continue a saved study with your own objective, without the tuner:
+
+```python
+from xgb_optuna_gpu import load_study_from_volume, save_study_to_volume
+
+volume_db = "/Volumes/main/ml/artifacts/optuna_runs/xgb_tweedie/study.db"
+study, local_db = load_study_from_volume("xgb_tweedie", volume_db)    # copy to /local_disk0, load, fix crashed trials
+study.sampler = optuna.samplers.TPESampler(n_startup_trials=15, seed=42 + len(study.trials))
+try:
+    study.optimize(objective, n_trials=20, callbacks=[lambda st, tr: save_study_to_volume(local_db, volume_db)])
+finally:
+    save_study_to_volume(local_db, volume_db)
+```
+
+Don't open `study.db` on the volume directly with `optuna.load_study`; you'll get the same error.
+Copy it to local disk first (`copy_study_to_local`).
 
 ## Notes
 

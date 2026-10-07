@@ -17,7 +17,13 @@ from optuna.trial import FrozenTrial, TrialState
 
 from .data import build_dmatrices
 from .losses import LossSpec, SpaceEntry, get_loss
-from .storage import SyncedSQLiteStorage, is_fuse_path, normalize_path
+from .storage import (
+    copy_study_to_local,
+    default_local_dir,
+    is_fuse_path,
+    normalize_path,
+    save_study_to_volume,
+)
 from .trainer import DEFAULT_EVAL_METRICS, TrainResult, overfit_index, train_xgb_model
 
 DEFAULT_SEARCH_SPACE: dict[str, SpaceEntry] = {
@@ -81,11 +87,12 @@ class XGBOptunaTuner:
 
     Storage:
       * ``storage`` given (e.g. ``"postgresql://..."`` or an Optuna storage object): used as is.
-      * otherwise SQLite. If ``output_dir`` is on a Databricks FUSE mount (``/dbfs``,
-        ``/Volumes``, ``/Workspace``; SQLite fails there with "disk I/O error"), or
-        ``sync_db=True``, the live DB sits in ``local_db_dir`` (default
-        ``/local_disk0/tmp/optuna_local_db``) and ``<study_dir>/study.db`` is a snapshot
-        refreshed after every trial and restored on the next run.
+      * otherwise SQLite at ``<study_dir>/study.db``. If ``output_dir`` is on a Databricks
+        FUSE mount (``/Volumes``, ``/dbfs``, ``/Workspace``; SQLite fails there with
+        "disk I/O error"), or ``sync_db=True``, Optuna uses a local copy
+        ``<local_db_dir>/<study_name>.db`` (default dir ``/local_disk0/tmp/optuna``):
+        ``study.db`` is copied volume -> local when the tuner is created and
+        local -> volume after every trial.
     """
 
     def __init__(
@@ -122,12 +129,13 @@ class XGBOptunaTuner:
         self.study_dir = normalize_path(output_dir) / self.study_name
         self.study_dir.mkdir(parents=True, exist_ok=True)
 
-        self._synced: SyncedSQLiteStorage | None = None
+        self.volume_db = self.study_dir / "study.db"
+        self.local_db: Path | None = None  # set when the DB lives on local disk
         if storage is not None:
             self.storage = storage
         elif sync_db or (sync_db is None and is_fuse_path(self.study_dir)):
-            self._synced = SyncedSQLiteStorage(self.study_dir / "study.db", local_db_dir)
-            self.storage = self._synced.url
+            self.local_db = Path(local_db_dir or default_local_dir()) / f"{self.study_name}.db"
+            self.storage = copy_study_to_local(self.volume_db, self.local_db)
         else:
             self.storage = f"sqlite:///{(self.study_dir / 'study.db').resolve()}"
         # URL (or storage object) to pass to optuna.load_study for this study.
@@ -207,12 +215,12 @@ class XGBOptunaTuner:
         return study
 
     def sync_storage(self) -> None:
-        """Copy the local SQLite DB to the persistent path (no-op unless syncing)."""
-        if self._synced is not None:
+        """Copy the local study DB to the volume (no-op unless the DB lives on local disk)."""
+        if self.local_db is not None:
             try:
-                self._synced.backup()
-            except OSError as e:  # never lose a trial because the backup copy failed
-                self._log(f"[warn] could not back up study DB to {self._synced.persistent_path}: {e}")
+                save_study_to_volume(self.local_db, self.volume_db)
+            except OSError as e:  # a failed copy must not kill the tuning run
+                self._log(f"[warn] could not copy {self.local_db} to {self.volume_db}: {e}")
 
     def _recover(self, study: optuna.Study, max_retries_per_trial: int) -> None:
         """Fail trials left RUNNING by a crash and re-queue failed trials' params."""
@@ -326,7 +334,7 @@ class XGBOptunaTuner:
         study = self.load_study()
         self._recover(study, max_retries_per_trial)
         self.sync_storage()
-        where = f"{self.storage} -> synced to {self._synced.persistent_path}" if self._synced else self.storage
+        where = f"{self.storage} (copied to {self.volume_db})" if self.local_db else self.storage
         self._log(f"[study {self.study_name}] {self.n_complete(study)}/{n_trials} trials complete; storage={where}")
 
         restarts = 0
