@@ -30,7 +30,7 @@ tsfusion/
   metrics.py    RMSE, MAE, R2, NMAD (original target scale)
   trainer.py    Trainer (single GPU, AMP, per-epoch logs, checkpoints, early stopping, resume), load_checkpoint, predict_with
   synthetic.py  synthetic data in the same layout as the real data
-tests/          pytest suite (CPU, about 5 min)
+tests/          pytest suite (37 tests, CPU, about 1 min)
 notebooks/      the two demo notebooks
 ```
 
