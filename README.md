@@ -16,6 +16,7 @@ snapshot PLE ─► per-variable linear embedding ─► [CLS] + transformer    
 |---|---|
 | [`notebooks/01_demo_late_fusion_cls.ipynb`](notebooks/01_demo_late_fusion_cls.ipynb) | **Requested design**, end to end: data structures, missing/special treatment, patching, model, MSE training, Tweedie training with a search over `p`, reloading the best checkpoint |
 | [`notebooks/02_alternative_value_aware_tokens.ipynb`](notebooks/02_alternative_value_aware_tokens.ipynb) | Alternative: missing/special embeddings injected **into the value tokens** (early fusion), plus a hybrid. Controlled multi-seed comparison with the requested design |
+| [`notebooks/03_demo_early_fusion.ipynb`](notebooks/03_demo_early_fusion.ipynb) | **Recommended early-fusion design**, end to end with the same steps as 01. Adds value-aware token construction, inspection of the learned missing/special embeddings, and a side-by-side with the 01 runs |
 
 The notebooks were executed on CPU with synthetic data, so they use small models and few epochs. On a GPU they automatically use `d_model=64` and up to 150 epochs.
 
@@ -31,7 +32,7 @@ tsfusion/
   trainer.py    Trainer (single GPU, AMP, per-epoch logs, checkpoints, early stopping, resume), load_checkpoint, predict_with
   synthetic.py  synthetic data in the same layout as the real data
 tests/          pytest suite (37 tests, CPU, about 1 min)
-notebooks/      the two demo notebooks
+notebooks/      the three demo notebooks
 ```
 
 ## Quick start
