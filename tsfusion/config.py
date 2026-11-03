@@ -97,7 +97,7 @@ class TrainConfig:
     tweedie_power: float = 1.5                    # 1 <= p <= 3 (p=2 is Gamma); tune on validation
 
     # ---- optimisation ------------------------------------------------------------
-    batch_size: int = 256
+    batch_size: int = 256                         # PER GPU: global batch = batch_size x #GPUs
     eval_batch_size: int = 1024
     max_epochs: int = 100
     lr: float = 1e-3
@@ -113,7 +113,9 @@ class TrainConfig:
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 0.0
 
-    # ---- hardware: one GPU ---------------------------------------------------------
+    # ---- hardware ------------------------------------------------------------------
+    # one GPU by default; launched with `torchrun --nproc_per_node=N` the Trainer uses DDP on
+    # N GPUs (one process per GPU, cuda:LOCAL_RANK) and this index is ignored
     device: str = "cuda:0"                        # falls back to CPU (with a warning)
     use_amp: bool = True                          # mixed precision on the GPU
     amp_dtype: str = "auto"                       # "auto" | "bf16" | "fp16"

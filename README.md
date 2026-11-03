@@ -1,6 +1,6 @@
 # RI - Time Series
 
-`tsfusion` is a single-GPU PyTorch code base for a regression transformer that combines
+`tsfusion` is a PyTorch code base (one GPU by default, several GPUs with `torchrun`) for a regression transformer that combines
 
 * a **multivariate time series** (records × T=11 steps × V variables) with missing and special values,
 * **snapshot variables** that are already piecewise-linear encoded (PLE),
@@ -29,9 +29,11 @@ tsfusion/
   model.py      SlidingPatcher, factorized grid encoder with 2-D CLS, state / value / snapshot tokenizers, TSFusionTransformer
   losses.py     MSELoss, TweedieLoss (log link, 1 <= p <= 3), tweedie_deviance
   metrics.py    RMSE, MAE, R2, NMAD (original target scale)
-  trainer.py    Trainer (single GPU, AMP, per-epoch logs, checkpoints, early stopping, resume), load_checkpoint, predict_with
+  trainer.py    Trainer (one GPU or DDP, AMP, per-epoch logs, checkpoints, early stopping, resume), load_checkpoint, predict_with
+  distributed.py  multi-GPU helpers (DDP process group, gather / broadcast)
   synthetic.py  synthetic data in the same layout as the real data
-tests/          pytest suite (37 tests, CPU, about 1 min)
+scripts/        train.py (command line, one GPU or torchrun) and run_grid.sh (one experiment per GPU)
+tests/          pytest suite (41 tests incl. 2-process DDP, CPU, about 1 min)
 notebooks/      the three demo notebooks
 ```
 
@@ -74,7 +76,7 @@ y_new = predict_with(model, prep, cfg, prep.transform(new_raw))
 
 | requirement | implementation |
 |---|---|
-| single GPU | `TrainConfig.device="cuda:0"`. No DataParallel or DDP; the data can be kept on the GPU (`data_on_device`). Mixed precision is bf16 when supported, otherwise fp16 with GradScaler. Optional `torch.compile`. |
+| single GPU | `TrainConfig.device="cuda:0"` by default; the data can be kept on the GPU (`data_on_device`). Mixed precision is bf16 when supported, otherwise fp16 with GradScaler. Optional `torch.compile`. Several GPUs: see below. |
 | sliding patching per variable | `SlidingPatcher`: `(B,T,V) → (B,V,Np,P)`; `patch_len`, `patch_stride`; right-padding so the latest step is always covered |
 | one embedding for missing and for each special value | the state code is 0 regular, 1 missing, 1+k special k. `StatePatchEmbedding` holds one `nn.Embedding(2+K, ·)` shared by all variables and steps |
 | attention across variables, then across time, with CLS | `FactorizedBlock` + `GridEncoder` on a `(V+1)×(Np+1)` grid. Row 0 holds per-patch CLS tokens, column 0 per-variable CLS tokens, and the global CLS sits at (0,0) |
@@ -85,6 +87,35 @@ y_new = predict_with(model, prep, cfg, prep.transform(new_raw))
 | save the model every epoch | `epoch_XXX.pt`: model, optimizer, scheduler and scaler state, configs, fitted preprocessor. Loadable with `torch.load(weights_only=True)` |
 | model selected by lowest holdout RMSE | `best_model.pt`; the best weights are restored at the end of `fit` |
 | early stopping | `early_stopping_patience` / `early_stopping_min_delta` on validation RMSE |
+
+## Using several GPUs
+
+`device="cuda:0"` means GPU number 0. One GPU already runs all of its own cores, so a single-GPU run leaves the other GPUs idle. There are two ways to use them, and they suit different goals.
+
+**A. Several experiments at once, one per GPU** (best for tuning). Each GPU trains its own configuration: a different Tweedie power, seed, fusion mode or model size. There is no communication between GPUs, so 8 GPUs give 8 times the experiments, and each run behaves exactly like a single-GPU run.
+
+```bash
+bash scripts/run_grid.sh data/prepared runs/grid                 # edit CONFIGS in the script
+EXTRA_ARGS="--epochs 60 --scheduler cosine" bash scripts/run_grid.sh data/prepared runs/grid
+```
+
+**B. One run spread over all GPUs (DDP)** (best when a single run on large data is too slow). Launch the same script with `torchrun`; no code change is needed:
+
+```bash
+torchrun --standalone --nproc_per_node=8 scripts/train.py --data data/prepared --output-dir runs/ddp \
+    --batch-size 256 --lr 2e-3
+```
+
+* One process per GPU (`cuda:LOCAL_RANK`). Each GPU takes a shard of every global batch, and gradients are averaged across GPUs.
+* Evaluation is also sharded, and the predictions are gathered, so the metrics, best-epoch selection and early stopping are identical on every GPU.
+* Only the first process (rank 0) writes `train.log`, `metrics.csv` and the checkpoints. Checkpoints load exactly like single-GPU ones.
+* **`--batch-size` is per GPU**: the global batch is `batch_size × #GPUs`. With dropout off, 2 GPUs × 64 follows the same training path as 1 GPU × 128 (tested to within 1e-7 relative).
+* A larger global batch means fewer optimizer steps per epoch. Either raise the learning rate (start with about `sqrt(#GPUs) ×`; with 8 GPUs, try 2–3×) and re-check the warm-up, or keep the global batch unchanged by dividing the per-GPU batch by the number of GPUs.
+* `--warmup-epochs`, `--patience` and the schedulers keep their meaning in epochs.
+
+**The data for the script** is written once from Python with `save_dataset("data/prepared", {"train": train_raw, "val": val_raw}, n_special_codes=K, snapshot_group_sizes=group_sizes)`. This creates plain `.npy` files plus `meta.json`, which every process reads. `--data synthetic` runs the demo data.
+
+Which to use: the model is small (tens to hundreds of thousands of parameters), so DDP pays off only when one epoch over your data takes long. For choosing `p`, seeds or architecture, option A gives the most work per GPU hour. Notebooks always run on one GPU; DDP needs `torchrun`, so it runs through the script.
 
 ## Code review: what was wrong in the first draft and is now fixed
 
@@ -126,5 +157,5 @@ I reviewed the first version myself and had an independent review run on it. Tha
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q tests
+python -m pytest -q tests        # includes 2-process DDP tests on CPU (gloo backend)
 ```

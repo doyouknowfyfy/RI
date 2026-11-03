@@ -1,4 +1,9 @@
-"""Single-GPU training loop with per-epoch metrics, checkpointing and early stopping.
+"""Training loop with per-epoch metrics, checkpointing and early stopping.
+
+One GPU by default. Launched with ``torchrun --nproc_per_node=N`` it trains with
+DistributedDataParallel on N GPUs (see :mod:`tsfusion.distributed`): each GPU processes a
+shard of every global batch, gradients are averaged, evaluation is sharded and gathered,
+and only rank 0 writes logs / CSV / checkpoints.
 
 Per epoch
   1. one pass over the training data (mixed precision on GPU, gradient clipping)
@@ -11,6 +16,7 @@ Per epoch
 from __future__ import annotations
 
 import csv
+import inspect
 import json
 import logging
 import math
@@ -26,9 +32,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .config import ModelConfig, TrainConfig
 from .data import InMemoryLoader, Preprocessor, ProcessedData
+from .distributed import (all_gather_equal, all_reduce_sum, barrier, broadcast_object,
+                          init_distributed)
 from .losses import build_loss, tweedie_deviance
 from .metrics import regression_metrics
 from .model import TSFusionTransformer, count_parameters
@@ -45,7 +54,7 @@ def set_seed(seed: int) -> None:
 
 
 def resolve_device(name: str) -> torch.device:
-    """One GPU only: ``cuda:<i>`` if available (no DataParallel / DDP), else CPU."""
+    """``cuda:<i>`` if available, else CPU (with a warning)."""
     dev = torch.device(name)
     if dev.type == "cuda":
         if not torch.cuda.is_available():
@@ -59,13 +68,16 @@ def resolve_device(name: str) -> torch.device:
     return dev
 
 
-def _make_logger(output_dir: str, verbose: bool) -> logging.Logger:
+def _make_logger(output_dir: str, verbose: bool, enabled: bool = True) -> logging.Logger:
     logger = logging.getLogger(f"tsfusion.{os.path.abspath(output_dir)}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
     for h in list(logger.handlers):          # avoid duplicate handlers when re-running cells
         logger.removeHandler(h)
         h.close()
+    if not enabled:                          # non-zero DDP ranks stay silent
+        logger.addHandler(logging.NullHandler())
+        return logger
     fmt = logging.Formatter("%(asctime)s | %(message)s", "%H:%M:%S")
     fh = logging.FileHandler(os.path.join(output_dir, "train.log"))
     fh.setFormatter(fmt)
@@ -111,13 +123,17 @@ def _to_builtin(obj):
 # Trainer
 # =============================================================================
 class Trainer:
-    """Train :class:`TSFusionTransformer` on one GPU.
+    """Train :class:`TSFusionTransformer` on one GPU, or on several with DDP.
 
     Example::
 
         trainer = Trainer(model_cfg, train_cfg, preprocessor)
         history = trainer.fit(train_data, val_data)     # pandas DataFrame, one row / epoch
         y_hat = trainer.predict(val_data)                 # original scale
+
+    Under ``torchrun`` every process runs the same script; ``fit``, ``evaluate``,
+    ``predict`` and ``resume`` are collective (call them on all ranks). Their results are
+    identical on every rank; files are written by rank 0 only.
     """
 
     MONITOR = "val_rmse"
@@ -134,10 +150,27 @@ class Trainer:
                 and preprocessor.target_scaler.scale <= 0:
             raise ValueError("Tweedie with p >= 2 needs a strictly positive target")
 
-        set_seed(train_cfg.seed)
-        self.device = resolve_device(train_cfg.device)
+        use_cuda = torch.device(train_cfg.device).type == "cuda" and torch.cuda.is_available()
+        self.rank, self.world_size, local_rank = init_distributed(use_cuda)
+        self.distributed = self.world_size > 1
+        self.is_main = self.rank == 0
+
+        set_seed(train_cfg.seed)                 # identical initial weights on every rank
+        self.device = resolve_device(f"cuda:{local_rank}" if self.distributed and use_cuda
+                                     else train_cfg.device)
         self.model = (model or TSFusionTransformer(model_cfg)).to(self.device)
-        self._fwd = torch.compile(self.model) if train_cfg.compile_model else self.model
+        train_module: nn.Module = self.model
+        if self.distributed:
+            # the model's only buffer is a constant mask, so no buffer syncing is needed
+            sync_kw = ({"forward_sync_buffers": False}
+                       if "forward_sync_buffers" in inspect.signature(DDP.__init__).parameters
+                       else {"broadcast_buffers": False})
+            train_module = DDP(self.model, **sync_kw,
+                               device_ids=[self.device.index] if self.device.type == "cuda" else None)
+            set_seed(train_cfg.seed + self.rank)     # different dropout masks per GPU
+        compile_ = torch.compile if train_cfg.compile_model else (lambda m: m)
+        self._train_fwd = compile_(train_module)      # DDP-wrapped: gradients are all-reduced
+        self._eval_fwd = compile_(self.model) if self.distributed else self._train_fwd
 
         # mixed precision: bf16 if the GPU supports it (no loss scaling needed), else fp16
         self.use_amp = train_cfg.use_amp and self.device.type == "cuda"
@@ -163,7 +196,7 @@ class Trainer:
         self._resume_scheduler_state = None
 
         os.makedirs(train_cfg.output_dir, exist_ok=True)
-        self.logger = _make_logger(train_cfg.output_dir, train_cfg.verbose)
+        self.logger = _make_logger(train_cfg.output_dir, train_cfg.verbose, enabled=self.is_main)
 
     # ------------------------------------------------------------------ helpers
     def _prepare(self, data: ProcessedData) -> ProcessedData:
@@ -172,10 +205,11 @@ class Trainer:
     def _batch_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
-    def _forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _forward(self, batch: Dict[str, torch.Tensor], train: bool = False) -> torch.Tensor:
+        fwd = self._train_fwd if train else self._eval_fwd
         with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype,
                             enabled=self.use_amp):
-            return self._fwd(batch["x"], batch["state"], batch.get("snapshot"))
+            return fwd(batch["x"], batch["state"], batch.get("snapshot"))
 
     def _build_scheduler(self, steps_per_epoch: int):
         cfg = self.cfg
@@ -215,7 +249,7 @@ class Trainer:
         for i, batch in enumerate(loader):
             batch = self._batch_to_device(batch)
             self._manual_warmup()
-            out = self._forward(batch)
+            out = self._forward(batch, train=True)
             loss = self.loss_fn(out, batch["y"])
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"non-finite training loss at epoch {epoch}, step {i}; "
@@ -236,24 +270,35 @@ class Trainer:
             if self.cfg.log_every_n_steps and (i + 1) % self.cfg.log_every_n_steps == 0:
                 self.logger.info(f"  epoch {epoch} step {i + 1}/{len(loader)} "
                                  f"loss {total / count:.5f} lr {self._current_lr():.2e}")
+        if self.distributed:                 # running loss over all GPUs (logging only)
+            t = all_reduce_sum(torch.tensor([total, count], dtype=torch.float64,
+                                            device=self.device))
+            total, count = t[0].item(), t[1].item()
         return total / max(count, 1)
 
     @torch.no_grad()
     def _predict_link(self, data: ProcessedData, indices: Optional[np.ndarray] = None
                       ) -> Tuple[torch.Tensor, float]:
-        """Raw network output (link scale) and mean loss (if targets are present)."""
+        """Raw network output (link scale) for all requested records and the mean loss (if
+        targets are present). With DDP each rank predicts one contiguous shard; the shards
+        are gathered so every rank returns the full, identically ordered result."""
         self.model.eval()
-        loader = InMemoryLoader(data, self.cfg.eval_batch_size, shuffle=False, indices=indices)
-        outs, total, count = [], 0.0, 0
-        for batch in loader:
-            batch = self._batch_to_device(batch)
-            out = self._forward(batch).float()
-            if "y" in batch:
-                n = out.shape[0]
-                total += self.loss_fn(out, batch["y"]).item() * n
-                count += n
-            outs.append(out)
-        return torch.cat(outs), (total / count if count else float("nan"))
+        idx = np.arange(len(data)) if indices is None else np.asarray(indices)
+        n = len(idx)
+        mine = idx
+        if self.distributed:
+            chunk = math.ceil(n / self.world_size)
+            padded = np.concatenate([idx, np.full(chunk * self.world_size - n, idx[-1])])
+            mine = padded[self.rank * chunk:(self.rank + 1) * chunk]
+        loader = InMemoryLoader(data, self.cfg.eval_batch_size, shuffle=False, indices=mine)
+        out = torch.cat([self._forward(self._batch_to_device(b)).float() for b in loader])
+        if self.distributed:
+            out = all_gather_equal(out)[:n]
+        loss = float("nan")
+        if data.y is not None:
+            y = data.y[torch.as_tensor(idx, device=data.y.device)].to(out.device)
+            loss = self.loss_fn(out, y).item()
+        return out, loss
 
     def _to_original_scale(self, link_out: torch.Tensor) -> np.ndarray:
         z = self.loss_fn.inverse_link(link_out).cpu().numpy()
@@ -303,6 +348,8 @@ class Trainer:
 
     def save_checkpoint(self, path: str, epoch: int, metrics: Dict[str, float],
                         with_optimizer: bool = True) -> None:
+        if not self.is_main:                 # weights are identical on all ranks
+            return
         tmp = path + ".tmp"
         torch.save(self._checkpoint(epoch, metrics, with_optimizer), tmp)
         os.replace(tmp, path)          # atomic: never leaves a half-written checkpoint
@@ -320,25 +367,32 @@ class Trainer:
         self.global_step = ckpt["global_step"]
         self.best_metric, self.best_epoch = ckpt["best_val_rmse"], ckpt["best_epoch"]
         out, epoch = self.cfg.output_dir, ckpt["epoch"]
-        # forget everything an abandoned run wrote after the resumed epoch
-        for f in os.listdir(out):
-            m = re.fullmatch(r"epoch_(\d+)\.pt", f)
-            if m and int(m.group(1)) > epoch:
-                os.remove(os.path.join(out, f))
-        self._best_state = None
+        # read everything first (all ranks), then let rank 0 rewrite the files
+        self._best_state, best = None, None
         best_src = os.path.join(out, f"epoch_{self.best_epoch:03d}.pt")
         if self.best_epoch >= 1 and os.path.exists(best_src):
-            b = torch.load(best_src, map_location="cpu", weights_only=True)
-            self._best_state = b["model_state"]
-            for k in ("optimizer_state", "scaler_state", "scheduler_state"):
-                b.pop(k, None)
-            torch.save(b, os.path.join(out, "best_model.pt"))   # consistent with the resume
+            best = torch.load(best_src, map_location="cpu", weights_only=True)
+            self._best_state = best["model_state"]
         hist_path = os.path.join(out, "metrics.csv")
+        hist = None
         if os.path.exists(hist_path):
             hist = pd.read_csv(hist_path)
             hist = hist[hist["epoch"] <= epoch]
-            hist.to_csv(hist_path, index=False)        # drop rows after the resumed epoch
             self.history = hist.to_dict("records")
+        barrier()
+        if self.is_main:
+            # forget everything an abandoned run wrote after the resumed epoch
+            for f in os.listdir(out):
+                m = re.fullmatch(r"epoch_(\d+)\.pt", f)
+                if m and int(m.group(1)) > epoch:
+                    os.remove(os.path.join(out, f))
+            if best is not None:
+                for k in ("optimizer_state", "scaler_state", "scheduler_state"):
+                    best.pop(k, None)
+                torch.save(best, os.path.join(out, "best_model.pt"))  # consistent with resume
+            if hist is not None:
+                hist.to_csv(hist_path, index=False)    # drop rows after the resumed epoch
+        barrier()
         return epoch + 1
 
     def _start_fresh(self) -> None:
@@ -350,10 +404,12 @@ class Trainer:
         if stale and not self.cfg.overwrite_output_dir:
             raise FileExistsError(f"{out} already contains {len(stale)} checkpoint/metric files; "
                                   "use another output_dir, resume(), or overwrite_output_dir=True")
-        for f in stale:
-            os.remove(os.path.join(out, f))
-        if stale:
-            self.logger.info(f"removed {len(stale)} files of a previous run in {out}")
+        if self.is_main:
+            for f in stale:
+                os.remove(os.path.join(out, f))
+            if stale:
+                self.logger.info(f"removed {len(stale)} files of a previous run in {out}")
+        barrier()
 
     # ------------------------------------------------------------------ main loop
     def fit(self, train_data: ProcessedData, val_data: ProcessedData,
@@ -362,7 +418,8 @@ class Trainer:
         if train_data.y is None or val_data.y is None:
             raise ValueError("train and validation data need targets")
         train_data, val_data = self._prepare(train_data), self._prepare(val_data)
-        train_loader = InMemoryLoader(train_data, cfg.batch_size, shuffle=True, seed=cfg.seed)
+        train_loader = InMemoryLoader(train_data, cfg.batch_size, shuffle=True, seed=cfg.seed,
+                                      rank=self.rank, world_size=self.world_size)
         if start_epoch == 1:
             self._start_fresh()
         if self.scheduler is None:
@@ -381,13 +438,17 @@ class Trainer:
             train_eval_idx = np.sort(rng.choice(len(train_data), cfg.train_eval_max_samples,
                                                 replace=False))
 
-        with open(os.path.join(cfg.output_dir, "config.json"), "w") as f:
-            json.dump({"model": self.model_cfg.to_dict(), "train": cfg.to_dict(),
-                       "target_scaler": self.prep.target_scaler.state_dict()}, f, indent=2)
+        if self.is_main:
+            with open(os.path.join(cfg.output_dir, "config.json"), "w") as f:
+                json.dump({"model": self.model_cfg.to_dict(), "train": cfg.to_dict(),
+                           "n_gpus": self.world_size,
+                           "target_scaler": self.prep.target_scaler.state_dict()}, f, indent=2)
         csv_path = os.path.join(cfg.output_dir, "metrics.csv")
 
         amp = str(self.amp_dtype).split('.')[-1] if self.use_amp else "off"
-        self.logger.info(f"device={self.device} amp={amp} "
+        gpus = (f"gpus={self.world_size} (DDP, global batch {cfg.batch_size * self.world_size}) "
+                if self.distributed else "")
+        self.logger.info(f"device={self.device} {gpus}amp={amp} "
                          f"params={count_parameters(self.model):,} train={len(train_data):,} "
                          f"val={len(val_data):,} loss={cfg.loss}"
                          + (f"(p={cfg.tweedie_power})" if cfg.loss == "tweedie" else "")
@@ -410,6 +471,7 @@ class Trainer:
 
             improved = math.isfinite(val_m["rmse"]) and \
                 val_m["rmse"] < self.best_metric - cfg.early_stopping_min_delta
+            improved = bool(broadcast_object(improved))   # same decision on every GPU
             if improved:
                 self.best_metric, self.best_epoch, bad_epochs = val_m["rmse"], epoch, 0
                 self._best_state = {k: v.detach().to("cpu", copy=True)
@@ -427,7 +489,8 @@ class Trainer:
                 row["gpu_peak_mem_mb"] = torch.cuda.max_memory_allocated(self.device) / 2**20
             row = _to_builtin(row)
             self.history.append(row)
-            self._append_csv(csv_path, row)
+            if self.is_main:
+                self._append_csv(csv_path, row)
 
             if cfg.save_every_epoch:
                 self.save_checkpoint(os.path.join(cfg.output_dir, f"epoch_{epoch:03d}.pt"),
@@ -450,6 +513,7 @@ class Trainer:
                                  f"at epoch {self.best_epoch})")
                 break
 
+        barrier()
         if self._best_state is not None:
             self.model.load_state_dict(self._best_state)
             self.logger.info(f"restored best model from epoch {self.best_epoch} "

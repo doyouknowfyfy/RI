@@ -493,6 +493,46 @@ def pack_snapshot(snapshot_2d: np.ndarray, group_sizes: Sequence[int]) -> np.nda
 
 
 # =============================================================================
+# Saving / loading prepared splits (for scripts and multi-GPU runs)
+# =============================================================================
+_RAW_FIELDS = ("x", "missing", "special", "snapshot", "y")
+
+
+def save_dataset(directory: str, splits: Dict[str, "RawData"], n_special_codes: int,
+                 snapshot_group_sizes: Sequence[int], **extra_meta) -> None:
+    """Write each split as plain ``.npy`` files (``<split>_x.npy``, ``<split>_missing.npy``,
+    ...) plus ``meta.json``. Arrays must already be aligned (same record order)."""
+    import json
+    import os
+    os.makedirs(directory, exist_ok=True)
+    for name, raw in splits.items():
+        for field in _RAW_FIELDS:
+            arr = getattr(raw, field)
+            if arr is not None:
+                np.save(os.path.join(directory, f"{name}_{field}.npy"), arr)
+    meta = {"splits": list(splits), "n_special_codes": int(n_special_codes),
+            "snapshot_group_sizes": [int(g) for g in snapshot_group_sizes], **extra_meta}
+    with open(os.path.join(directory, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def load_dataset(directory: str) -> Tuple[Dict[str, "RawData"], dict]:
+    """Inverse of :func:`save_dataset`: returns ``({split: RawData}, meta)``."""
+    import json
+    import os
+    with open(os.path.join(directory, "meta.json")) as f:
+        meta = json.load(f)
+    splits = {}
+    for name in meta["splits"]:
+        arrs = {}
+        for field in _RAW_FIELDS:
+            path = os.path.join(directory, f"{name}_{field}.npy")
+            arrs[field] = np.load(path) if os.path.exists(path) else None
+        splits[name] = RawData(**arrs)
+    return splits, meta
+
+
+# =============================================================================
 # Batching
 # =============================================================================
 class InMemoryLoader:
@@ -500,21 +540,33 @@ class InMemoryLoader:
 
     For tabular-sized data this is much faster than ``torch.utils.data.DataLoader`` with
     per-item ``__getitem__`` + collation: each batch is a single fancy-index per tensor.
+
+    Multi-GPU (``world_size > 1``): every rank draws the SAME permutation (same seed and
+    epoch), keeps ``len // world_size * world_size`` records (drops at most
+    ``world_size - 1`` random records per epoch) and takes every ``world_size``-th one
+    starting at ``rank``. So all ranks run the same number of batches, and global batch k
+    is exactly what a single GPU would see with ``batch_size * world_size``.
     """
 
     def __init__(self, data: ProcessedData, batch_size: int, shuffle: bool = False,
-                 seed: int = 0, indices: Optional[np.ndarray] = None):
+                 seed: int = 0, indices: Optional[np.ndarray] = None,
+                 rank: int = 0, world_size: int = 1):
         self.data = data
         self.batch_size = int(batch_size)
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
         self.device = data.x.device
+        self.rank, self.world_size = int(rank), int(world_size)
         idx = np.arange(len(data)) if indices is None else np.asarray(indices)
         self.indices = torch.as_tensor(idx, dtype=torch.long)
 
+    def _per_rank(self) -> int:
+        n = len(self.indices)
+        return n // self.world_size if self.world_size > 1 else n
+
     def __len__(self) -> int:
-        return (len(self.indices) + self.batch_size - 1) // self.batch_size
+        return (self._per_rank() + self.batch_size - 1) // self.batch_size
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -524,6 +576,8 @@ class InMemoryLoader:
         if self.shuffle:
             g = torch.Generator().manual_seed(self.seed + self.epoch)
             idx = idx[torch.randperm(len(idx), generator=g)]
+        if self.world_size > 1:
+            idx = idx[: self._per_rank() * self.world_size][self.rank::self.world_size]
         idx = idx.to(self.device)
         for start in range(0, len(idx), self.batch_size):
             yield self.data.batch(idx[start:start + self.batch_size])
