@@ -265,8 +265,7 @@ def _embed_all(model, data: ProcessedData, batch_size: int) -> Dict[str, torch.T
     device = next(model.parameters()).device
     model.eval()
     parts: Dict[str, List[torch.Tensor]] = {}
-    for b in InMemoryLoader(data, batch_size):
-        b = {k: v.to(device) for k, v in b.items()}
+    for b in InMemoryLoader(data, batch_size, device=device):
         for k, v in model.embed(b["x"], b["state"], b.get("snapshot")).items():
             parts.setdefault(k, []).append(v.float())
     return {k: torch.cat(v) for k, v in parts.items()}
@@ -392,10 +391,13 @@ class InterpretationResult:
 
 
 def collect_interpretation(model: TSFusionTransformer, data: ProcessedData,
-                           batch_size: int = 256, max_records: Optional[int] = None,
+                           batch_size: int = 64, max_records: Optional[int] = None,
                            seed: int = 0) -> InterpretationResult:
     """Attention rollout, CLS attention, patch categories and embeddings for (a random
-    subset of) a dataset. Memory is O(N * V * Np) - use ``max_records`` on large data."""
+    subset of) a dataset. Results take O(N * V * Np) memory - use ``max_records`` on large
+    data. Recording materialises the attention weights: the variable stage alone needs
+    about ``batch_size * (Np+1) * n_heads * (V+1)**2 * 4`` bytes on the device, so lower
+    ``batch_size`` when there are hundreds of variables (e.g. 8 for V = 1000)."""
     idx = np.arange(len(data))
     if max_records is not None and max_records < len(data):
         idx = np.sort(np.random.default_rng(seed).choice(len(data), max_records, replace=False))
@@ -405,8 +407,7 @@ def collect_interpretation(model: TSFusionTransformer, data: ProcessedData,
     def add(k, v):
         acc.setdefault(k, []).append(v.detach().float().cpu().numpy())
 
-    for b in InMemoryLoader(data, batch_size, indices=idx):
-        b = {k: v.to(device) for k, v in b.items()}
+    for b in InMemoryLoader(data, batch_size, indices=idx, device=device):
         out, emb, det, maps = run_with_attention(model, b["x"], b["state"], b.get("snapshot"))
         add("link", out)
         for k, v in emb.items():

@@ -6,7 +6,7 @@ with ``dataclasses.asdict`` and restored with ``Config(**d)``.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union
 
 # How missing / special values are combined with regular values.
 #   "late"   : the design requested in the spec. Three CLS tokens are concatenated
@@ -119,7 +119,12 @@ class TrainConfig:
     device: str = "cuda:0"                        # falls back to CPU (with a warning)
     use_amp: bool = True                          # mixed precision on the GPU
     amp_dtype: str = "auto"                       # "auto" | "bf16" | "fp16"
-    data_on_device: bool = True                   # copy the whole dataset to GPU once
+    data_on_device: Union[bool, str] = "auto"     # True: copy train+val to the GPU once;
+                                                  # False: keep them in CPU memory and copy
+                                                  # one batch at a time (pinned, async);
+                                                  # "auto": True only if the data needs
+                                                  # < gpu_data_fraction of free GPU memory
+    gpu_data_fraction: float = 0.3
     compile_model: bool = False                   # torch.compile (PyTorch >= 2)
 
     # ---- bookkeeping -------------------------------------------------------------
@@ -141,6 +146,10 @@ class TrainConfig:
             raise ValueError(f"scheduler must be one of {SCHEDULERS}, got {self.scheduler!r}")
         if self.loss == "tweedie" and not (1.0 <= self.tweedie_power <= 3.0):
             raise ValueError("tweedie_power must be in [1, 3]")
+        if self.data_on_device not in (True, False, "auto"):
+            raise ValueError("data_on_device must be True, False or 'auto'")
+        if not 0.0 < self.gpu_data_fraction <= 1.0:
+            raise ValueError("gpu_data_fraction must be in (0, 1]")
         if self.amp_dtype not in ("auto", "bf16", "fp16"):
             raise ValueError("amp_dtype must be 'auto', 'bf16' or 'fp16'")
 

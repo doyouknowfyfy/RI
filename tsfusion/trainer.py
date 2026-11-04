@@ -46,6 +46,15 @@ from .model import TSFusionTransformer, count_parameters
 # =============================================================================
 # Utilities
 # =============================================================================
+NONFINITE_CHECK_EVERY = 50      # steps between checks of the running loss for NaN / inf
+
+
+def fits_on_gpu(need_bytes: int, free_bytes: int, fraction: float) -> bool:
+    """``data_on_device="auto"``: copy the data to the GPU only if it takes at most
+    ``fraction`` of the currently free GPU memory (the rest is left for activations)."""
+    return need_bytes <= fraction * free_bytes
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -199,8 +208,23 @@ class Trainer:
         self.logger = _make_logger(train_cfg.output_dir, train_cfg.verbose, enabled=self.is_main)
 
     # ------------------------------------------------------------------ helpers
-    def _prepare(self, data: ProcessedData) -> ProcessedData:
-        return data.to(self.device) if self.cfg.data_on_device else data
+    def _data_on_gpu(self, *datasets: ProcessedData) -> bool:
+        """Copy these datasets to the GPU once (True) or stream them per batch (False)."""
+        mode = self.cfg.data_on_device
+        if self.device.type != "cuda":
+            return False
+        if mode != "auto":
+            return bool(mode)
+        free, _ = torch.cuda.mem_get_info(self.device)
+        return fits_on_gpu(sum(d.nbytes() for d in datasets), free, self.cfg.gpu_data_fraction)
+
+    def _prepare(self, *datasets: ProcessedData):
+        """Place datasets according to ``data_on_device``; returns them in the same order."""
+        on_gpu = self._data_on_gpu(*datasets)
+        placed = [d.to(self.device) if on_gpu else d for d in datasets]
+        self._data_where = "GPU" if on_gpu else (
+            "CPU, streamed to the GPU per batch" if self.device.type == "cuda" else "CPU")
+        return placed[0] if len(placed) == 1 else placed
 
     def _batch_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -245,15 +269,16 @@ class Trainer:
     def train_one_epoch(self, loader: InMemoryLoader, epoch: int) -> float:
         self.model.train()
         loader.set_epoch(epoch)
-        total, count = 0.0, 0
+        # the running loss stays on the device: a .item() per step would make the CPU wait
+        # for every step and stop it preparing the next batch in the meantime
+        total = torch.zeros((), dtype=torch.float64, device=self.device)
+        count = 0
+        n_steps = len(loader)
         for i, batch in enumerate(loader):
             batch = self._batch_to_device(batch)
             self._manual_warmup()
             out = self._forward(batch, train=True)
             loss = self.loss_fn(out, batch["y"])
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"non-finite training loss at epoch {epoch}, step {i}; "
-                                         "try a lower lr, fp32 (use_amp=False) or check inputs")
             self.optimizer.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             if self.cfg.grad_clip:
@@ -265,16 +290,24 @@ class Trainer:
                 self.scheduler.step()
             self.global_step += 1
             n = batch["y"].shape[0]
-            total += loss.item() * n
+            total += loss.detach().double() * n
             count += n
-            if self.cfg.log_every_n_steps and (i + 1) % self.cfg.log_every_n_steps == 0:
-                self.logger.info(f"  epoch {epoch} step {i + 1}/{len(loader)} "
-                                 f"loss {total / count:.5f} lr {self._current_lr():.2e}")
+            log_now = self.cfg.log_every_n_steps and (i + 1) % self.cfg.log_every_n_steps == 0
+            if log_now or (i + 1) % NONFINITE_CHECK_EVERY == 0 or i + 1 == n_steps:
+                running = total.item() / count             # one sync every few steps
+                if not math.isfinite(running):
+                    raise FloatingPointError(
+                        f"non-finite training loss in epoch {epoch} (by step {i + 1}); try a "
+                        "lower lr, fp32 (use_amp=False) or check the inputs")
+                if log_now:
+                    self.logger.info(f"  epoch {epoch} step {i + 1}/{n_steps} "
+                                     f"loss {running:.5f} lr {self._current_lr():.2e}")
+        total_f, count_f = total.item(), float(count)
         if self.distributed:                 # running loss over all GPUs (logging only)
-            t = all_reduce_sum(torch.tensor([total, count], dtype=torch.float64,
+            t = all_reduce_sum(torch.tensor([total_f, count_f], dtype=torch.float64,
                                             device=self.device))
-            total, count = t[0].item(), t[1].item()
-        return total / max(count, 1)
+            total_f, count_f = t[0].item(), t[1].item()
+        return total_f / max(count_f, 1)
 
     @torch.no_grad()
     def _predict_link(self, data: ProcessedData, indices: Optional[np.ndarray] = None
@@ -290,7 +323,8 @@ class Trainer:
             chunk = math.ceil(n / self.world_size)
             padded = np.concatenate([idx, np.full(chunk * self.world_size - n, idx[-1])])
             mine = padded[self.rank * chunk:(self.rank + 1) * chunk]
-        loader = InMemoryLoader(data, self.cfg.eval_batch_size, shuffle=False, indices=mine)
+        loader = InMemoryLoader(data, self.cfg.eval_batch_size, shuffle=False, indices=mine,
+                                device=self.device)
         out = torch.cat([self._forward(self._batch_to_device(b)).float() for b in loader])
         if self.distributed:
             out = all_gather_equal(out)[:n]
@@ -417,9 +451,10 @@ class Trainer:
         cfg = self.cfg
         if train_data.y is None or val_data.y is None:
             raise ValueError("train and validation data need targets")
-        train_data, val_data = self._prepare(train_data), self._prepare(val_data)
+        train_data, val_data = self._prepare(train_data, val_data)
         train_loader = InMemoryLoader(train_data, cfg.batch_size, shuffle=True, seed=cfg.seed,
-                                      rank=self.rank, world_size=self.world_size)
+                                      rank=self.rank, world_size=self.world_size,
+                                      device=self.device)
         if start_epoch == 1:
             self._start_fresh()
         if self.scheduler is None:
@@ -453,6 +488,8 @@ class Trainer:
                          f"val={len(val_data):,} loss={cfg.loss}"
                          + (f"(p={cfg.tweedie_power})" if cfg.loss == "tweedie" else "")
                          + f" fusion={self.model_cfg.missing_fusion}")
+        self.logger.info(f"data: {(train_data.nbytes() + val_data.nbytes()) / 2**30:.2f} GiB "
+                         f"(train + val), kept on {self._data_where}")
         bad_epochs = 0
         for row in self.history:      # non-empty only after resume(): rebuild the counter
             bad_epochs = 0 if row["epoch"] == self.best_epoch else bad_epochs + 1
@@ -556,8 +593,7 @@ def predict_with(model: TSFusionTransformer, prep: Preprocessor, train_cfg: Trai
     device = next(model.parameters()).device
     model.eval()
     outs = []
-    for batch in InMemoryLoader(data, batch_size):
-        batch = {k: v.to(device) for k, v in batch.items()}
+    for batch in InMemoryLoader(data, batch_size, device=device):
         outs.append(model(batch["x"], batch["state"], batch.get("snapshot")).float())
     z = loss_fn.inverse_link(torch.cat(outs)).cpu().numpy()
     return prep.target_scaler.inverse_transform(z)

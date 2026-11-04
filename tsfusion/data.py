@@ -234,7 +234,8 @@ class RawData:
 
 @dataclass
 class ProcessedData:
-    """Model-ready tensors (kept on CPU; the trainer moves them to the GPU)."""
+    """Model-ready tensors, on the CPU. The trainer either copies them to the GPU once
+    (small data) or streams them batch by batch (``TrainConfig.data_on_device``)."""
     x: torch.Tensor                        # (N, T, V) float32, standardised, 0 at non-regular cells
     state: torch.Tensor                    # (N, T, V) uint8 state codes
     snapshot: Optional[torch.Tensor]       # (N, S, max_bins) float32 or None
@@ -243,6 +244,11 @@ class ProcessedData:
 
     def __len__(self) -> int:
         return self.x.shape[0]
+
+    def nbytes(self) -> int:
+        """Memory the tensors need on a device (y_raw stays on the CPU)."""
+        return sum(t.numel() * t.element_size()
+                   for t in (self.x, self.state, self.snapshot, self.y) if t is not None)
 
     def to(self, device: torch.device) -> "ProcessedData":
         mv = lambda t: None if t is None else t.to(device)  # noqa: E731
@@ -546,17 +552,23 @@ class InMemoryLoader:
     ``world_size - 1`` random records per epoch) and takes every ``world_size``-th one
     starting at ``rank``. So all ranks run the same number of batches, and global batch k
     is exactly what a single GPU would see with ``batch_size * world_size``.
+
+    ``device``: where the batches should end up. If the data already lives there, batches
+    are cut on that device. If the data is on the CPU and ``device`` is a GPU, only one
+    batch at a time is copied: it is cut on the CPU, pinned, sent with a non-blocking copy,
+    and the next batch is prepared while the GPU works on the current one.
     """
 
     def __init__(self, data: ProcessedData, batch_size: int, shuffle: bool = False,
                  seed: int = 0, indices: Optional[np.ndarray] = None,
-                 rank: int = 0, world_size: int = 1):
+                 rank: int = 0, world_size: int = 1, device=None):
         self.data = data
         self.batch_size = int(batch_size)
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
-        self.device = data.x.device
+        self.source_device = data.x.device
+        self.device = self.source_device if device is None else torch.device(device)
         self.rank, self.world_size = int(rank), int(world_size)
         idx = np.arange(len(data)) if indices is None else np.asarray(indices)
         self.indices = torch.as_tensor(idx, dtype=torch.long)
@@ -578,6 +590,40 @@ class InMemoryLoader:
             idx = idx[torch.randperm(len(idx), generator=g)]
         if self.world_size > 1:
             idx = idx[: self._per_rank() * self.world_size][self.rank::self.world_size]
-        idx = idx.to(self.device)
-        for start in range(0, len(idx), self.batch_size):
-            yield self.data.batch(idx[start:start + self.batch_size])
+        if _same_device(self.source_device, self.device):
+            idx = idx.to(self.source_device)
+            for start in range(0, len(idx), self.batch_size):
+                yield self.data.batch(idx[start:start + self.batch_size])
+        else:
+            yield from stream_batches(self.data, idx, self.batch_size, self.device)
+
+
+def _same_device(a: torch.device, b: torch.device) -> bool:
+    if a.type != b.type:
+        return False
+    if a.type != "cuda" or a.index is None or b.index is None:
+        return True
+    return a.index == b.index
+
+
+def stream_batches(data: ProcessedData, idx: torch.Tensor, batch_size: int,
+                   device: torch.device) -> Iterator[Dict[str, torch.Tensor]]:
+    """Batches of ``data`` (kept in CPU memory) moved to ``device`` one at a time, with a
+    one-batch look-ahead: while the caller computes on batch k, batch k+1 is already cut,
+    pinned and on its way (non-blocking copy from page-locked memory)."""
+    idx = idx.cpu()
+    pin = device.type == "cuda"
+
+    def load(start: int) -> Dict[str, torch.Tensor]:
+        b = data.batch(idx[start:start + batch_size])
+        if pin:
+            b = {k: v.pin_memory() for k, v in b.items()}
+        return {k: v.to(device, non_blocking=pin) for k, v in b.items()}
+
+    starts = list(range(0, len(idx), batch_size))
+    nxt = load(starts[0]) if starts else None
+    for i in range(len(starts)):
+        cur = nxt
+        if i + 1 < len(starts):
+            nxt = load(starts[i + 1])
+        yield cur

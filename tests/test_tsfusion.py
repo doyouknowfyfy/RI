@@ -326,3 +326,45 @@ def test_preprocessor_log_vars_roundtrip(raw_splits):
     a = prep.transform(train).x
     b = Preprocessor.from_state_dict(prep.state_dict()).transform(train).x
     assert torch.equal(a, b) and prep.ts_log_vars == [0, 2]
+
+
+# ----------------------------------------------------------------------------- memory / streaming
+def test_stream_batches_match_in_memory_batches(raw_splits):
+    from tsfusion import InMemoryLoader
+    from tsfusion.data import _same_device, stream_batches
+    train, _ = raw_splits
+    d = Preprocessor(3, [8, 10, 6, 10, 8]).fit(train).transform(train)
+    idx = torch.randperm(len(d), generator=torch.Generator().manual_seed(0))
+    direct = [d.batch(idx[s:s + 37]) for s in range(0, len(d), 37)]
+    streamed = list(stream_batches(d, idx, 37, torch.device("cpu")))
+    assert len(direct) == len(streamed)
+    for a, b in zip(direct, streamed):
+        assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a)
+    assert d.nbytes() == sum(t.numel() * t.element_size() for t in (d.x, d.state, d.snapshot, d.y))
+    loader = InMemoryLoader(d, 64, device="cpu")
+    assert sum(len(b["y"]) for b in loader) == len(d)
+    assert _same_device(torch.device("cuda"), torch.device("cuda:1"))
+    assert not _same_device(torch.device("cuda:0"), torch.device("cuda:1"))
+    assert not _same_device(torch.device("cpu"), torch.device("cuda:0"))
+
+
+def test_auto_data_placement_rule():
+    from tsfusion.trainer import fits_on_gpu
+    gib = 2 ** 30
+    assert not fits_on_gpu(50 * gib, 39 * gib, 0.3)   # the reported OOM case -> stream batches
+    assert fits_on_gpu(5 * gib, 39 * gib, 0.3)
+    with pytest.raises(ValueError):
+        TrainConfig(data_on_device="yes")
+    assert TrainConfig().data_on_device == "auto"
+
+
+def test_nonfinite_loss_still_raises(tmp_path, synth, raw_splits):
+    train, val = raw_splits
+    mcfg = _model_cfg(synth)
+    prep = Preprocessor(3, mcfg.snapshot_group_sizes).fit(train)
+    t = Trainer(mcfg, TrainConfig(batch_size=64, max_epochs=1, device="cpu", verbose=False,
+                                  output_dir=str(tmp_path / "nan")), prep)
+    with torch.no_grad():
+        t.model.head.net[-1].bias.fill_(float("nan"))
+    with pytest.raises(FloatingPointError):
+        t.fit(prep.transform(train), prep.transform(val))
