@@ -76,13 +76,25 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model)
         self.proj = nn.Linear(d_model, d_model)
         self.attn_dropout = attn_dropout
+        # interpretation: when True, attention is computed explicitly and the weights
+        # (B, H, L, L) are kept in `attn_weights` (see tsfusion.interpret.record_attention)
+        self.store_attn = False
+        self.attn_weights: Optional[torch.Tensor] = None
 
     def forward(self, x: torch.Tensor, key_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, D = x.shape
         q, k, v = self.qkv(x).view(B, L, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)
         mask = None if key_valid is None else key_valid[:, None, None, :]   # (B,1,1,L)
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, dropout_p=self.attn_dropout if self.training else 0.0)
+        if self.store_attn:
+            scores = (q.float() @ k.float().transpose(-2, -1)) / math.sqrt(self.d_head)
+            if mask is not None:
+                scores = scores.masked_fill(~mask, float("-inf"))
+            attn = scores.softmax(dim=-1)
+            self.attn_weights = attn.detach()
+            out = (attn @ v.float()).to(v.dtype)
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=self.attn_dropout if self.training else 0.0)
         return self.proj(out.transpose(1, 2).reshape(B, L, D))
 
 
@@ -265,9 +277,12 @@ class SnapshotEncoder(nn.Module):
         self.norm = nn.LayerNorm(d)
         self.emb_drop = nn.Dropout(cfg.dropout)
 
-    def forward(self, snap: torch.Tensor) -> torch.Tensor:          # (B, S, K)
+    def tokenize(self, snap: torch.Tensor) -> torch.Tensor:         # (B, S, K) -> (B, S, d)
         snap = snap * self.bin_mask                                  # guard against junk padding
-        tok = torch.einsum("bsk,skd->bsd", snap, self.weight) + self.bias
+        return torch.einsum("bsk,skd->bsd", snap, self.weight) + self.bias
+
+    def forward(self, snap: torch.Tensor) -> torch.Tensor:          # (B, S, K)
+        tok = self.tokenize(snap)
         x = torch.cat([self.cls.expand(tok.shape[0], 1, -1).to(tok.dtype), tok], dim=1)
         x = self.emb_drop(x)
         for blk in self.blocks:
@@ -338,8 +353,14 @@ class TSFusionTransformer(nn.Module):
         return self.patcher.n_patches
 
     def embed(self, x: torch.Tensor, state: torch.Tensor,
-              snapshot: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """Return the CLS embeddings of every branch (useful for inspection / reuse)."""
+              snapshot: Optional[torch.Tensor] = None,
+              details: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
+        """Return the CLS embeddings of every branch (useful for inspection / reuse).
+
+        If a dict is passed as ``details`` it is filled with intermediate tensors:
+        ``state_patches`` (B,V,Np,P), ``tokens`` (patch tokens entering the time-series
+        encoder, B,V,Np,d), ``ts_grid`` (encoder output incl. CLS row/column,
+        B,V+1,Np+1,d) and ``snapshot_tokens`` (B,S,d)."""
         state = state.long()
         # values at missing / special cells never reach the value pathway, whatever the
         # caller put there (imputed 0, sentinel like -999, NaN ...)
@@ -356,7 +377,11 @@ class TSFusionTransformer(nn.Module):
         else:
             tok = self.value_embed(x_p, s_p)
             valid = None                          # every token carries information
-        out["cls_ts"] = self.ts_encoder(tok, valid)
+        if details is None:
+            out["cls_ts"] = self.ts_encoder(tok, valid)
+        else:
+            out["cls_ts"], details["ts_grid"] = self.ts_encoder(tok, valid, return_grid=True)
+            details["state_patches"], details["tokens"] = s_p, tok
 
         if self.has_special_branch:
             stok = self.state_embed(s_p)
@@ -367,6 +392,8 @@ class TSFusionTransformer(nn.Module):
             if snapshot is None:
                 raise ValueError("model was built with snapshot variables but none were given")
             out["cls_snapshot"] = self.snapshot_encoder(snapshot)
+            if details is not None:
+                details["snapshot_tokens"] = self.snapshot_encoder.tokenize(snapshot)
         return out
 
     def forward(self, x: torch.Tensor, state: torch.Tensor,

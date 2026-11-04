@@ -17,6 +17,7 @@ snapshot PLE ─► per-variable linear embedding ─► [CLS] + transformer    
 | [`notebooks/01_demo_late_fusion_cls.ipynb`](notebooks/01_demo_late_fusion_cls.ipynb) | **Requested design**, end to end: data structures, missing/special treatment, patching, model, MSE training, Tweedie training with a search over `p`, reloading the best checkpoint |
 | [`notebooks/02_alternative_value_aware_tokens.ipynb`](notebooks/02_alternative_value_aware_tokens.ipynb) | Alternative: missing/special embeddings injected **into the value tokens** (early fusion), plus a hybrid. Controlled multi-seed comparison with the requested design |
 | [`notebooks/03_demo_early_fusion.ipynb`](notebooks/03_demo_early_fusion.ipynb) | **Recommended early-fusion design**, end to end with the same steps as 01. Adds value-aware token construction, inspection of the learned missing/special embeddings, and a side-by-side with the 01 runs |
+| [`notebooks/04_visualize_early_fusion.ipynb`](notebooks/04_visualize_early_fusion.ipynb) | **Inside the early-fusion model**: cell embeddings of missing/special values, CLS and snapshot-token embedding spaces, attention rollout and per-stage attention for one record, relevance of missing/special patches across records, snapshot attention, and what the prediction depends on (branch ablation, permutation importance, state probe) |
 
 The notebooks were executed on CPU with synthetic data, so they use small models and few epochs. On a GPU they automatically use `d_model=64` and up to 150 epochs.
 
@@ -31,9 +32,11 @@ tsfusion/
   metrics.py    RMSE, MAE, R2, NMAD (original target scale)
   trainer.py    Trainer (one GPU or DDP, AMP, per-epoch logs, checkpoints, early stopping, resume), load_checkpoint, predict_with
   distributed.py  multi-GPU helpers (DDP process group, gather / broadcast)
+  interpret.py  attention recording + rollout, missing/special relevance, embedding maps, ablation / permutation / state probes
+  viz.py        matplotlib figures for interpret results (state-aware colours and glyphs)
   synthetic.py  synthetic data in the same layout as the real data
 scripts/        train.py (command line, one GPU or torchrun) and run_grid.sh (one experiment per GPU)
-tests/          pytest suite (41 tests incl. 2-process DDP, CPU, about 1 min)
+tests/          pytest suite (47 tests incl. 2-process DDP and attention-rollout checks, CPU, about 2 min)
 notebooks/      the three demo notebooks
 ```
 

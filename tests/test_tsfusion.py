@@ -6,45 +6,14 @@ import pandas as pd
 import pytest
 import torch
 
-from tsfusion import (ModelConfig, Preprocessor, RawData, Trainer, TrainConfig, TSFusionTransformer,
+from tsfusion import (ModelConfig, Preprocessor, Trainer, TrainConfig, TSFusionTransformer,
                       TweedieLoss, build_state, default_target_mode, encode_special_values,
                       group_columns_by_prefix, load_checkpoint, long_df_to_array, predict_with,
                       regression_metrics)
 from tsfusion.model import SlidingPatcher
-from tsfusion.synthetic import make_synthetic_dataset
 
 
-# ----------------------------------------------------------------------------- fixtures
-@pytest.fixture(scope="module")
-def synth():
-    return make_synthetic_dataset(n_records=400, n_vars=5, seed=1)
-
-
-def _raw(d, ids):
-    x, _ = long_df_to_array(d["ts_df"], record_ids=ids)
-    m, _ = long_df_to_array(d["missing_df"], record_ids=ids, fill_value=1)
-    s, _ = long_df_to_array(d["special_df"], record_ids=ids, fill_value=0)
-    cols = [c for _, cs in group_columns_by_prefix(d["snapshot_ple_df"].columns) for c in cs]
-    snap = d["snapshot_ple_df"].loc[ids, cols].to_numpy()
-    return RawData(x, m, s.astype(np.int64), snap, d["y"].loc[ids].to_numpy())
-
-
-@pytest.fixture(scope="module")
-def raw_splits(synth):
-    return _raw(synth, synth["train_ids"]), _raw(synth, synth["val_ids"])
-
-
-def _group_sizes(synth):
-    return [len(c) for _, c in group_columns_by_prefix(synth["snapshot_ple_df"].columns)]
-
-
-def _model_cfg(synth, **kw):
-    base = dict(n_vars=len(synth["var_names"]), n_steps=11,
-                n_special_codes=synth["n_special_codes"],
-                snapshot_group_sizes=_group_sizes(synth), d_model=32, n_heads=4,
-                n_ts_layers=1, head_hidden=32)
-    base.update(kw)
-    return ModelConfig(**base)
+from helpers import _model_cfg  # noqa: E402  (fixtures synth / raw_splits live in conftest.py)
 
 
 # ----------------------------------------------------------------------------- data
