@@ -7,6 +7,7 @@ Produces pandas DataFrames in the "as delivered" format:
                    (-999 / -998 / -997 ...), exactly what usually arrives from upstream.
 * ``missing_df``   same shape, 1 = missing
 * ``special_df``   same shape, 0 = not special, k = special code k
+* ``state_df``     same shape, both combined: 0 regular, 1 missing, 1+k special code k
 * ``snapshot_ple_df`` one row per record, PLE columns ``<feature>_bin<j>``
 * ``snapshot_raw_df`` the raw snapshot variables (for reference)
 * ``y``            positive, right-skewed target with a heavy tail
@@ -105,6 +106,8 @@ def make_synthetic_dataset(n_records: int = 6000, n_steps: int = 11, n_vars: int
     ts_df = to_long(x_obs)
     missing_df = to_long(missing.astype(np.int8))
     special_df = to_long(special.astype(np.int8))
+    # the same information as ONE matrix: 0 regular, 1 missing, 1+k special value k
+    state_df = to_long(np.where(special > 0, special + 1, missing.astype(np.int64)).astype(np.uint8))
 
     # ---- train / validation split + PLE fitted on train only --------------------------
     perm = rng.permutation(N)
@@ -120,7 +123,7 @@ def make_synthetic_dataset(n_records: int = 6000, n_steps: int = 11, n_vars: int
     snapshot_ple_df = pd.concat(ple_parts, axis=1)
 
     return {
-        "ts_df": ts_df, "missing_df": missing_df, "special_df": special_df,
+        "ts_df": ts_df, "missing_df": missing_df, "special_df": special_df, "state_df": state_df,
         "snapshot_raw_df": snap_raw, "snapshot_ple_df": snapshot_ple_df,
         "y": pd.Series(y, index=pd.Index(ids, name="record_id"), name="y"),
         "train_ids": train_ids, "val_ids": val_ids,

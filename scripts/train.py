@@ -66,7 +66,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 def load_data(args):
     """Return (train RawData, validation RawData, n_special_codes, snapshot_group_sizes)."""
     if args.data != "synthetic":
-        splits, meta = load_dataset(args.data)
+        splits, meta = load_dataset(args.data, mmap=True)   # read chunk by chunk from disk
         return splits["train"], splits["val"], meta["n_special_codes"], meta["snapshot_group_sizes"]
 
     from tsfusion.synthetic import make_synthetic_dataset

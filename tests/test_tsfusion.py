@@ -368,3 +368,126 @@ def test_nonfinite_loss_still_raises(tmp_path, synth, raw_splits):
         t.model.head.net[-1].bias.fill_(float("nan"))
     with pytest.raises(FloatingPointError):
         t.fit(prep.transform(train), prep.transform(val))
+
+
+# ----------------------------------------------------------------------------- combined state matrix
+def _combined(raw):
+    from tsfusion import RawData
+    return RawData(raw.x.copy(), snapshot=raw.snapshot, y=raw.y,
+                   state=build_state(raw.missing, raw.special))
+
+
+def test_combined_state_matches_separate_inputs(raw_splits):
+    train, val = raw_splits
+    comb_tr, comb_va = _combined(train), _combined(val)
+    assert comb_tr.state.dtype == np.uint8 and comb_tr.combined
+    p_sep = Preprocessor(3, [8, 10, 6, 10, 8]).fit(train)
+    p_cmb = Preprocessor(3, [8, 10, 6, 10, 8]).fit(comb_tr)
+    np.testing.assert_allclose(p_sep.ts_mean, p_cmb.ts_mean, rtol=1e-6)
+    np.testing.assert_allclose(p_sep.ts_std, p_cmb.ts_std, rtol=1e-6)
+    a, b = p_sep.transform(val), p_cmb.transform(comb_va)
+    assert torch.equal(a.state, b.state) and torch.allclose(a.x, b.x, atol=1e-6)
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 50, None])
+def test_chunked_fit_and_transform_are_exact(raw_splits, chunk):
+    train, _ = raw_splits
+    comb = _combined(train)
+    st = comb.state
+    reg = st == 0
+    ref_mean = np.array([train.x[:, :, v][reg[:, :, v]].astype(np.float64).mean() for v in range(5)])
+    ref_std = np.array([train.x[:, :, v][reg[:, :, v]].astype(np.float64).std() for v in range(5)])
+    p = Preprocessor(3, [8, 10, 6, 10, 8]).fit(comb, chunk_size=chunk)
+    np.testing.assert_allclose(p.ts_mean, ref_mean, rtol=1e-5)
+    np.testing.assert_allclose(p.ts_std, ref_std, rtol=1e-5)
+    full = p.transform(comb, chunk_size=len(comb))
+    part = p.transform(comb, chunk_size=chunk)
+    assert torch.equal(full.x, part.x) and torch.equal(full.state, part.state)
+
+
+def test_inplace_transform_reuses_input_buffers(raw_splits):
+    train, _ = raw_splits
+    p = Preprocessor(3, [8, 10, 6, 10, 8]).fit(_combined(train))
+    ref = p.transform(_combined(train))
+    comb = _combined(train)
+    out = p.transform(comb, inplace=True, chunk_size=13)
+    assert np.shares_memory(out.x.numpy(), comb.x) and np.shares_memory(out.state.numpy(), comb.state)
+    assert torch.equal(out.x, ref.x) and torch.equal(out.state, ref.state)
+    with pytest.raises(ValueError, match="already transformed"):
+        p.transform(comb)
+
+
+def test_nan_becomes_missing_and_code_validation(raw_splits):
+    from tsfusion import RawData
+    train, _ = raw_splits
+    comb = _combined(train)
+    reg = np.argwhere(comb.state == 0)[0]
+    spec = np.argwhere(comb.state >= 2)[0]
+    comb.x[tuple(reg)] = np.nan
+    comb.x[tuple(spec)] = np.nan
+    p = Preprocessor(3, [8, 10, 6, 10, 8]).fit(comb)
+    out = p.transform(comb)
+    assert out.state[tuple(reg)] == 1 and out.state[tuple(spec)] == comb.state[tuple(spec)]
+    assert out.x[tuple(reg)] == 0
+    bad = _combined(train)
+    bad.state[0, 0, 0] = 9                                   # > K+1 = 4
+    with pytest.raises(ValueError, match="codes must be"):
+        Preprocessor(3, [8, 10, 6, 10, 8]).fit(bad)
+    with pytest.raises(TypeError, match="integer"):
+        RawData(train.x, state=comb.state.astype(np.float32))
+    with pytest.raises(ValueError, match="not both"):
+        RawData(train.x, train.missing, train.special, state=comb.state)
+
+
+def test_chunked_inplace_memory_is_small():
+    import tracemalloc
+    from tsfusion import RawData
+    rng = np.random.default_rng(0)
+    n, t, v = 4000, 11, 60
+    x = rng.normal(size=(n, t, v)).astype(np.float32)
+    st = np.where(rng.random((n, t, v)) < 0.1, rng.integers(1, 5, (n, t, v)), 0).astype(np.uint8)
+    raw = RawData(x, state=st, y=rng.gamma(2, 1, n))
+    p = Preprocessor(3, target_mode="mean_scale").fit(raw, chunk_size=200)
+    tracemalloc.start()
+    p.transform(RawData(x.copy(), state=st.copy(), y=raw.y), chunk_size=200, inplace=True)
+    tracemalloc.stop()      # the two input copies above are made before tracing starts? no:
+    tracemalloc.start()
+    raw2 = RawData(x.copy(), state=st.copy(), y=raw.y)
+    base, _ = tracemalloc.get_traced_memory()
+    tracemalloc.reset_peak()
+    p.transform(raw2, chunk_size=200, inplace=True)
+    _, peak_inplace = tracemalloc.get_traced_memory()
+    tracemalloc.reset_peak()
+    p.transform(RawData(x, state=st, y=raw.y), chunk_size=200)
+    _, peak_copy = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    cells = n * t * v
+    assert (peak_inplace - base) / cells < 1.0               # only chunk-sized temporaries
+    assert (peak_copy - base) / cells < 5.0 + 1.0            # new x (4 B) + state (1 B) + chunk
+
+
+def test_save_load_combined_with_mmap(tmp_path, raw_splits):
+    from tsfusion import load_dataset, save_dataset
+    train, val = raw_splits
+    save_dataset(str(tmp_path), {"train": _combined(train), "val": _combined(val)}, 3, [8, 10, 6, 10, 8])
+    splits, meta = load_dataset(str(tmp_path), mmap=True)
+    tr = splits["train"]
+    for a in (tr.x, tr.state):          # views onto the files on disk, not copies in RAM
+        assert not a.flags.owndata and not a.flags.writeable
+    assert tr.combined
+    p = Preprocessor(3, meta["snapshot_group_sizes"]).fit(splits["train"])
+    out = p.transform(splits["val"])
+    ref = Preprocessor(3, [8, 10, 6, 10, 8]).fit(_combined(train)).transform(_combined(val))
+    assert torch.allclose(out.x, ref.x, atol=1e-6) and torch.equal(out.state, ref.state)
+    with pytest.raises(ValueError, match="writable"):
+        p.transform(splits["val"], inplace=True)
+
+
+def test_training_with_combined_input(tmp_path, synth, raw_splits):
+    train, val = raw_splits
+    mcfg = _model_cfg(synth, missing_fusion="early")
+    prep = Preprocessor(3, mcfg.snapshot_group_sizes).fit(_combined(train))
+    hist = Trainer(mcfg, TrainConfig(batch_size=64, max_epochs=2, device="cpu", verbose=False,
+                                     output_dir=str(tmp_path / "comb")), prep).fit(
+        prep.transform(_combined(train)), prep.transform(_combined(val)))
+    assert len(hist) == 2 and hist["val_rmse"].notna().all()

@@ -18,6 +18,7 @@ snapshot PLE ─► per-variable linear embedding ─► [CLS] + transformer    
 | [`notebooks/02_alternative_value_aware_tokens.ipynb`](notebooks/02_alternative_value_aware_tokens.ipynb) | Alternative: missing/special embeddings injected **into the value tokens** (early fusion), plus a hybrid. Controlled multi-seed comparison with the requested design |
 | [`notebooks/03_demo_early_fusion.ipynb`](notebooks/03_demo_early_fusion.ipynb) | **Recommended early-fusion design**, end to end with the same steps as 01. Adds value-aware token construction, inspection of the learned missing/special embeddings, and a side-by-side with the 01 runs |
 | [`notebooks/04_visualize_early_fusion.ipynb`](notebooks/04_visualize_early_fusion.ipynb) | **Inside the early-fusion model**: cell embeddings of missing/special values, CLS and snapshot-token embedding spaces, attention rollout and per-stage attention for one record, relevance of missing/special patches across records, snapshot attention, and what the prediction depends on (branch ablation, permutation importance, state probe) |
+| [`notebooks/05_combined_state_input.ipynb`](notebooks/05_combined_state_input.ipynb) | **One combined missing/special matrix as input** (0 regular, 1 missing, 2..K+1 special), with unchanged embedding and fusion. Covers uint8 storage, chunked and in-place preprocessing, memory-mapped data, memory measured and projected to 2M + 1M × 11 × 460, training, and the learned code embeddings |
 
 The notebooks were executed on CPU with synthetic data, so they use small models and few epochs. On a GPU they automatically use `d_model=64` and up to 150 epochs.
 
@@ -36,7 +37,7 @@ tsfusion/
   viz.py        matplotlib figures for interpret results (state-aware colours and glyphs)
   synthetic.py  synthetic data in the same layout as the real data
 scripts/        train.py (command line, one GPU or torchrun) and run_grid.sh (one experiment per GPU)
-tests/          pytest suite (47 tests incl. 2-process DDP and attention-rollout checks, CPU, about 2 min)
+tests/          pytest suite (60 tests incl. 2-process DDP, attention rollout, combined-state and memory checks, CPU, about 1 min)
 notebooks/      the three demo notebooks
 ```
 
@@ -46,19 +47,22 @@ notebooks/      the three demo notebooks
 from tsfusion import *
 
 # 1) arrays, all in the SAME record order
-#    x: (N, 11, V) float, missing: (N, 11, V) 0/1, special: (N, 11, V) int codes 0..K,
-#    snapshot: (N, sum of PLE bins) float, y: (N,)
+#    x: (N, 11, V) float32
+#    state: (N, 11, V) uint8, ONE matrix: 0 regular, 1 missing, 2..K+1 special value 1..K
+#           (or pass the two matrices instead: RawData(x, missing, special, snapshot, y))
+#    snapshot: (N, sum of PLE bins) float32, y: (N,)
 groups = group_columns_by_prefix(snapshot_ple_df.columns)            # [(feature, [cols]), ...]
 cols = [c for _, cs in groups for c in cs]
 group_sizes = [len(cs) for _, cs in groups]
-train_raw = RawData(x_tr, missing_tr, special_tr, snapshot_ple_df.loc[train_ids, cols].to_numpy(), y_tr)
-val_raw   = RawData(x_va, missing_va, special_va, snapshot_ple_df.loc[val_ids, cols].to_numpy(), y_va)
+train_raw = RawData(x_tr, state=state_tr, snapshot=snapshot_ple_df.loc[train_ids, cols].to_numpy(), y=y_tr)
+val_raw   = RawData(x_va, state=state_va, snapshot=snapshot_ple_df.loc[val_ids, cols].to_numpy(), y=y_va)
 
-# 2) preprocessing, fitted on train only
+# 2) preprocessing, fitted on train only (works in chunks; inplace=True reuses the input arrays)
 loss = "tweedie"                                                     # or "mse"
 prep = Preprocessor(n_special_codes=K, snapshot_group_sizes=group_sizes,
                     target_mode=default_target_mode(loss)).fit(train_raw)
-train, val = prep.transform(train_raw), prep.transform(val_raw)
+train = prep.transform(train_raw, inplace=True)                      # train_raw is consumed
+val = prep.transform(val_raw, inplace=True)
 
 # 3) model + training on one GPU
 model_cfg = ModelConfig(n_vars=V, n_steps=11, n_special_codes=K, snapshot_group_sizes=group_sizes,
@@ -147,7 +151,7 @@ I reviewed the first version myself and had an independent review run on it. Tha
 4. **MSE choices.** MSE on the raw (standardised) target is what RMSE measures, but extreme values dominate the gradient (we clip gradients). MSE on `log1p(y)` (`target_mode="log1p_standard"`) is more stable, but back-transformed predictions are biased low for the mean (they are closer to the median), which hurts RMSE.
 5. **Late fusion cannot relate a missing value to the observed values around it**, because the two branches only meet in the head. Notebook 02 shows the token-level alternative. Run the comparison on your data.
 6. **Short series.** With T=11, sliding patches give few tokens: 9 with `P=3, S=1`, 5 with `P=4, S=2`. `patch_len=1` (one token per cell) is affordable and worth trying.
-7. **Memory scales with the number of records and the number of variables.** The data itself stays in CPU memory and goes to the GPU one batch at a time unless it needs less than 30% of the free GPU memory (`data_on_device="auto"`; set `True` or `False` to force either). Activations: each grid branch has `(V+1)(Np+1)` tokens per record, and attention across variables is O(V²). For V in the hundreds, reduce `batch_size` / `eval_batch_size` or `d_model`, use a larger stride, enable `gradient_checkpointing`, and keep AMP on. `gpu_peak_mem_mb` is logged each epoch.
+7. **Memory scales with the number of records and the number of variables.** Preprocessing works in chunks, so its working memory is under 1 GB at the default chunk size. The processed data costs 5 bytes per cell (float32 value + uint8 state code); with `transform(..., inplace=True)` it reuses the input arrays, and with `load_dataset(..., mmap=True)` the raw arrays stay on disk. For 2M + 1M records × 11 × 460 that is about 78 GB of RAM at the peak, down from about 607 GB with the earlier separate-matrix, whole-array preprocessing (measured in notebook 05). On the GPU, the data stays in CPU memory and goes over one batch at a time unless it needs less than 30% of the free GPU memory (`data_on_device="auto"`). Activations: each grid branch has `(V+1)(Np+1)` tokens per record, and attention across variables is O(V²). For V in the hundreds, reduce `batch_size` / `eval_batch_size` or `d_model`, use a larger stride, enable `gradient_checkpointing`, and keep AMP on. `gpu_peak_mem_mb` is logged each epoch.
 8. **Leakage risk upstream.** PLE bins, scaling statistics and the target transform must be fitted on the training split only. The code does this for its own steps, but your PLE vectors come from upstream.
 9. **Data contract.**
    * Missing snapshot values must be encoded explicitly (NaN raises an error).

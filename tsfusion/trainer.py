@@ -495,8 +495,9 @@ class Trainer:
                          f"val={len(val_data):,} loss={cfg.loss}"
                          + (f"(p={cfg.tweedie_power})" if cfg.loss == "tweedie" else "")
                          + f" fusion={self.model_cfg.missing_fusion}")
-        self.logger.info(f"data: {(train_data.nbytes() + val_data.nbytes()) / 2**30:.2f} GiB "
-                         f"(train + val), kept on {self._data_where}")
+        size = train_data.nbytes() + val_data.nbytes()
+        size_txt = f"{size / 2**30:.2f} GiB" if size >= 2**30 else f"{size / 2**20:.1f} MiB"
+        self.logger.info(f"data: {size_txt} (train + val), kept on {self._data_where}")
         bad_epochs = 0
         for row in self.history:      # non-empty only after resume(): rebuild the counter
             bad_epochs = 0 if row["epoch"] == self.best_epoch else bad_epochs + 1
