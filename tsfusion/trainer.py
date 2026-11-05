@@ -46,6 +46,14 @@ from .model import TSFusionTransformer, count_parameters
 # =============================================================================
 # Utilities
 # =============================================================================
+def _grad_scaler(enabled: bool):
+    """Loss scaling for fp16. ``torch.amp.GradScaler`` exists from PyTorch 2.3; older
+    versions (e.g. older Databricks ML runtimes) only have ``torch.cuda.amp.GradScaler``."""
+    if hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 NONFINITE_CHECK_EVERY = 50      # steps between checks of the running loss for NaN / inf
 
 
@@ -188,8 +196,7 @@ class Trainer:
             self.amp_dtype = torch.bfloat16
         else:
             self.amp_dtype = torch.float16
-        self.scaler = torch.amp.GradScaler(
-            "cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
+        self.scaler = _grad_scaler(enabled=self.use_amp and self.amp_dtype == torch.float16)
         if self.device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
