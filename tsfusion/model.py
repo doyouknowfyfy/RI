@@ -68,7 +68,16 @@ class SelfAttention(nn.Module):
 
     ``key_valid``: ``(B, L)`` bool, True = the token can be attended to. Uses
     ``F.scaled_dot_product_attention`` (flash / memory-efficient kernels on GPU).
+
+    The factorized encoder calls this with very many short sequences (attention across
+    time runs ``batch x (V+1)`` sequences, e.g. 256 x 461 = 118,016). CUDA limits the 2nd
+    and 3rd grid dimensions of a kernel launch to 65,535 and the fused attention kernels
+    put the sequence batch there, so larger calls fail with "CUDA error: invalid
+    configuration argument". Calls are therefore split into slices of at most
+    ``max_batch`` sequences - same result, gradients flow through every slice.
     """
+
+    max_batch = 32_768
 
     def __init__(self, d_model: int, n_heads: int, attn_dropout: float = 0.0):
         super().__init__()
@@ -81,20 +90,32 @@ class SelfAttention(nn.Module):
         self.store_attn = False
         self.attn_weights: Optional[torch.Tensor] = None
 
-    def forward(self, x: torch.Tensor, key_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, L, D = x.shape
-        q, k, v = self.qkv(x).view(B, L, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)
-        mask = None if key_valid is None else key_valid[:, None, None, :]   # (B,1,1,L)
+    def _attend(self, q, k, v, mask):
         if self.store_attn:
             scores = (q.float() @ k.float().transpose(-2, -1)) / math.sqrt(self.d_head)
             if mask is not None:
                 scores = scores.masked_fill(~mask, float("-inf"))
             attn = scores.softmax(dim=-1)
-            self.attn_weights = attn.detach()
-            out = (attn @ v.float()).to(v.dtype)
+            return (attn @ v.float()).to(v.dtype), attn.detach()
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=self.attn_dropout if self.training else 0.0)
+        return out, None
+
+    def forward(self, x: torch.Tensor, key_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, L, D = x.shape
+        q, k, v = self.qkv(x).view(B, L, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)
+        mask = None if key_valid is None else key_valid[:, None, None, :]   # (B,1,1,L)
+        step = max(1, int(self.max_batch))
+        if B <= step:
+            out, weights = self._attend(q, k, v, mask)
         else:
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, dropout_p=self.attn_dropout if self.training else 0.0)
+            parts = [self._attend(q[i:i + step], k[i:i + step], v[i:i + step],
+                                  None if mask is None else mask[i:i + step])
+                     for i in range(0, B, step)]
+            out = torch.cat([o for o, _ in parts])
+            weights = torch.cat([w for _, w in parts]) if self.store_attn else None
+        if self.store_attn:
+            self.attn_weights = weights
         return self.proj(out.transpose(1, 2).reshape(B, L, D))
 
 

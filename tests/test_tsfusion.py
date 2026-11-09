@@ -491,3 +491,29 @@ def test_training_with_combined_input(tmp_path, synth, raw_splits):
                                      output_dir=str(tmp_path / "comb")), prep).fit(
         prep.transform(_combined(train)), prep.transform(_combined(val)))
     assert len(hist) == 2 and hist["val_rmse"].notna().all()
+
+
+# ----------------------------------------------------------------------------- many sequences
+@pytest.mark.parametrize("fusion", ["early", "late"])
+def test_attention_split_into_slices_matches_single_call(synth, raw_splits, fusion, monkeypatch):
+    """Attention across time runs batch x (V+1) sequences (118k for 256 x 461), more than
+    CUDA's 65,535 grid limit; it is split into slices - results must be identical."""
+    from tsfusion.model import SelfAttention
+    train, _ = raw_splits
+    cfg = _model_cfg(synth, missing_fusion=fusion, dropout=0.0, head_dropout=0.0)
+    d = Preprocessor(3, cfg.snapshot_group_sizes).fit(train).transform(train)
+    torch.manual_seed(0)
+    model = TSFusionTransformer(cfg)
+    b = slice(0, 12)
+    out_full = model(d.x[b], d.state[b], d.snapshot[b])
+    g_full = torch.autograd.grad(out_full.sum(), list(model.parameters()), allow_unused=True)
+    monkeypatch.setattr(SelfAttention, "max_batch", 7)       # force many slices
+    out_split = model(d.x[b], d.state[b], d.snapshot[b])
+    g_split = torch.autograd.grad(out_split.sum(), list(model.parameters()), allow_unused=True)
+    assert torch.allclose(out_full, out_split, atol=1e-6)
+    for a, c in zip(g_full, g_split):
+        if a is not None:
+            assert torch.allclose(a, c, atol=1e-5)
+    from tsfusion.interpret import run_with_attention
+    _, _, _, maps = run_with_attention(model, d.x[b], d.state[b], d.snapshot[b])
+    assert maps.time[0].shape[0] == 12 and torch.allclose(maps.time[0].sum(-1), torch.ones(()), atol=1e-5)
