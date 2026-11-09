@@ -141,3 +141,40 @@ def test_load_study_from_volume(tmp_path):
     assert retry.state == TrialState.COMPLETE and retry.params["x"] == crashed.params["x"]
     saved = optuna.load_study(study_name="s", storage=f"sqlite:///{volume_db}")
     assert len(saved.trials) == 5
+
+
+def test_fit_final_model(client, loader, tmp_path):
+    """Tuned params -> fixed-round refit -> metrics agree with XGBoost -> bundle saved."""
+    import numpy as np
+
+    from xgb_optuna_gpu import (
+        build_dmatrices, decile_table, get_loss, load_tuned_params, predict,
+        regression_metrics, save_model_bundle, to_numpy, train_xgb_model,
+    )
+
+    t = _tuner(client, loader, tmp_path / "runs", "tweedie")
+    t.optimize(n_trials=2)
+    best = load_tuned_params(t.study_dir, max_overfit=t.max_overfit)
+    assert best["trial"] == t.best_trial().number
+    assert load_tuned_params(t.study_dir, trial=0)["trial"] == 0
+    assert not {"objective", "eval_metric", "device", "tree_method"} & set(best["params"])
+
+    X_tr, y_tr, X_va, y_va = loader()
+    dtr, dva = build_dmatrices(client, X_tr, y_tr, X_va, y_va, max_bin=best["params"]["max_bin"])
+    n_trees = best["best_iteration"] + 1
+    booster, res = train_xgb_model(
+        client, dtr, dva, best["params"], get_loss(best["loss"]), X_tr, y_tr, X_va, y_va,
+        num_boost_round=n_trees, early_stopping_rounds=None, use_gpu=False,
+    )
+    assert booster.num_boosted_rounds() == n_trees and res.best_iteration == n_trees - 1
+
+    y, p = to_numpy(y_va), to_numpy(predict(client, booster, X_va))
+    m = regression_metrics(y, p, tweedie_power=best["params"]["tweedie_variance_power"])
+    assert np.isclose(m["rmse"], res.valid_metrics["rmse"], rtol=1e-4)
+    assert np.isclose(m["mae"], res.valid_metrics["mae"], rtol=1e-4)
+    assert np.isclose(m["mphe"], res.valid_metrics["mphe"], rtol=1e-4)
+    deciles = decile_table(y, p)
+    assert len(deciles) == 10 and np.isclose(deciles["share_of_total_target"].sum(), 1.0)
+
+    out = save_model_bundle(booster, res, tmp_path / "model", {"loss": best["loss"]})
+    assert {f.name for f in out.iterdir()} == {"booster.ubj", "metrics.json", "model_card.json"}

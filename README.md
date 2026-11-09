@@ -12,8 +12,11 @@ xgb_optuna_gpu/
 ├── losses.py    MSE / pseudo-Huber / Tweedie specs (objective, loss metric, extra tunables)
 ├── trainer.py   train_xgb_model(): one dask.xgboost run + early stopping + saved booster/metrics
 ├── storage.py   copy the study DB between /local_disk0 and a volume (Databricks)
-└── tuner.py     XGBOptunaTuner: TPE multi-objective study, resume, best-model report
-notebooks/demo_xgb_optuna_gpu.ipynb   end-to-end demo
+├── tuner.py     XGBOptunaTuner: TPE multi-objective study, resume, best-model report
+├── final_fit.py load_tuned_params() from a study; save_model_bundle()
+└── evaluate.py  metrics (rmse, mae, mphe, R2, normalized Gini), decile calibration table
+notebooks/demo_xgb_optuna_gpu.ipynb   end-to-end tuning demo
+notebooks/fit_final_model.ipynb       fit, evaluate and save the final model with the selected hyper-parameters
 tests/test_smoke.py                   CPU tests (losses, resume after crash / GPU error, synced SQLite)
 ```
 
@@ -94,6 +97,24 @@ finally:
 
 Don't open `study.db` on the volume directly with `optuna.load_study`; you'll get the same error.
 Copy it to local disk first (`copy_study_to_local`).
+
+## Fitting the final model
+
+`notebooks/fit_final_model.ipynb` takes the hyper-parameters of the best trial (or a trial number you choose, or a
+dict you set by hand) and fits the model in one of two modes:
+
+* `early_stopping`: train on train, early-stop on valid. This reproduces the tuned model.
+* `train_plus_valid`: train on train + valid with a fixed number of trees, `(best_iteration + 1) × ROUND_SCALE`
+  from the tuning trial. Evaluate this one on a separate test set.
+
+The notebook then reports metrics per split, a decile calibration table and plot, and feature importance. It saves
+`booster.ubj`, `metrics.json` and `model_card.json` to `MODEL_DIR` (a volume path works).
+
+```python
+from xgb_optuna_gpu import load_tuned_params
+tuned = load_tuned_params("/Volumes/main/ml/artifacts/optuna_runs/xgb_tweedie", trial=None, max_overfit=0.1)
+tuned["loss"], tuned["params"], tuned["best_iteration"]
+```
 
 ## Notes
 
