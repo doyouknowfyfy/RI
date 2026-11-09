@@ -1,0 +1,6 @@
+torch>=2.1          # on Databricks: use the runtime's own build (ML runtime), do not reinstall
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+pytest>=7
+jupyter
