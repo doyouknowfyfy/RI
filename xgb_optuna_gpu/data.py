@@ -63,6 +63,25 @@ def load_dask_data(
     return X_train, y_train, X_valid, y_valid
 
 
+def load_dask_split(
+    path: str,
+    target: str,
+    features: Sequence[str] | None = None,
+    fmt: str = "parquet",
+    use_gpu: bool = True,
+    client: Client | None = None,
+    **read_kwargs,
+):
+    """Read one split (e.g. a test set) into persisted ``(X, y)`` Dask collections."""
+    df = _read(path, fmt, use_gpu, **read_kwargs)
+    features = list(features) if features is not None else [c for c in df.columns if c != target]
+    X, y = df[features], df[target]
+    if client is not None:
+        X, y = client.persist([X, y])
+        wait([X, y])
+    return X, y
+
+
 def build_dmatrices(
     client: Client,
     X_train,

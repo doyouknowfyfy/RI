@@ -74,7 +74,7 @@ def train_xgb_model(
     X_valid,
     y_valid,
     num_boost_round: int = 5000,
-    early_stopping_rounds: int = 50,
+    early_stopping_rounds: int | None = 50,
     eval_metrics: Sequence[str] = DEFAULT_EVAL_METRICS,
     use_gpu: bool = True,
     save_dir: str | Path | None = None,
@@ -85,6 +85,8 @@ def train_xgb_model(
     ``params`` holds the tree / regularisation params (e.g. from Optuna); objective,
     eval metrics and device are filled in from ``loss``. Early stopping monitors the loss
     metric on ``valid`` and the returned booster is truncated to the best iteration.
+    With ``early_stopping_rounds=None`` exactly ``num_boost_round`` trees are built and
+    ``dvalid`` is only monitored (e.g. a final refit on train+valid with a fixed round count).
     If ``save_dir`` is given, ``booster.ubj`` and ``metrics.json`` are written there.
     """
     full_params = {
@@ -97,13 +99,17 @@ def train_xgb_model(
     full_params["eval_metric"] = loss.eval_metrics(full_params, eval_metrics)
     loss_metric = loss.loss_metric_name(full_params)
 
-    early_stop = xgb.callback.EarlyStopping(
-        rounds=early_stopping_rounds,
-        metric_name=loss_metric,
-        data_name="valid",
-        maximize=False,
-        save_best=True,
-    )
+    callbacks = []
+    if early_stopping_rounds is not None:
+        callbacks.append(
+            xgb.callback.EarlyStopping(
+                rounds=early_stopping_rounds,
+                metric_name=loss_metric,
+                data_name="valid",
+                maximize=False,
+                save_best=True,
+            )
+        )
     t0 = time.perf_counter()
     output = dxgb.train(
         client,
@@ -111,7 +117,7 @@ def train_xgb_model(
         dtrain,
         num_boost_round=num_boost_round,
         evals=[(dtrain, "train"), (dvalid, "valid")],
-        callbacks=[early_stop],
+        callbacks=callbacks,
         verbose_eval=verbose_eval,
     )
     train_seconds = time.perf_counter() - t0
@@ -123,7 +129,7 @@ def train_xgb_model(
     train_metrics = {m: float(v[best_it]) for m, v in history["train"].items()}
     valid_metrics = {m: float(v[best_it]) for m, v in history["valid"].items()}
 
-    # Booster is already truncated to the best iteration (save_best=True).
+    # With early stopping the booster is already truncated to the best iteration (save_best=True).
     pred_train = dxgb.inplace_predict(client, booster, X_train)
     pred_valid = dxgb.inplace_predict(client, booster, X_valid)
 
