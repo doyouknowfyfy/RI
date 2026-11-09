@@ -132,6 +132,11 @@ class TrainConfig:
     output_dir: str = "runs/experiment"
     overwrite_output_dir: bool = True             # fresh run: delete old checkpoints/metrics
                                                   # in output_dir (False -> raise instead)
+    local_staging: Union[bool, str] = "auto"      # write files on local disk, copy each finished
+                                                  # file to output_dir; "auto" = when output_dir
+                                                  # is /Volumes, /dbfs or /Workspace (no appends)
+    staging_dir: Optional[str] = None             # local directory for that (default:
+                                                  # /local_disk0/tmp/... or the system temp dir)
     save_every_epoch: bool = True
     save_optimizer_state: bool = True             # needed to resume training
     train_eval_max_samples: Optional[int] = None  # eval-mode metrics on (a subset of) train
@@ -146,6 +151,8 @@ class TrainConfig:
             raise ValueError(f"scheduler must be one of {SCHEDULERS}, got {self.scheduler!r}")
         if self.loss == "tweedie" and not (1.0 <= self.tweedie_power <= 3.0):
             raise ValueError("tweedie_power must be in [1, 3]")
+        if self.local_staging not in (True, False, "auto"):
+            raise ValueError("local_staging must be True, False or 'auto'")
         if self.data_on_device not in (True, False, "auto"):
             raise ValueError("data_on_device must be True, False or 'auto'")
         if not 0.0 < self.gpu_data_fraction <= 1.0:

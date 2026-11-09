@@ -37,7 +37,7 @@ tsfusion/
   viz.py        matplotlib figures for interpret results (state-aware colours and glyphs)
   synthetic.py  synthetic data in the same layout as the real data
 scripts/        train.py (command line, one GPU or torchrun) and run_grid.sh (one experiment per GPU)
-tests/          pytest suite (60 tests incl. 2-process DDP, attention rollout, combined-state and memory checks, CPU, about 1 min)
+tests/          pytest suite (63 tests incl. 2-process DDP, attention rollout, combined-state, memory and no-append-storage checks, CPU, about 1 min)
 notebooks/      the three demo notebooks
 ```
 
@@ -123,6 +123,13 @@ torchrun --standalone --nproc_per_node=8 scripts/train.py --data data/prepared -
 **The data for the script** is written once from Python with `save_dataset("data/prepared", {"train": train_raw, "val": val_raw}, n_special_codes=K, snapshot_group_sizes=group_sizes)`. This creates plain `.npy` files plus `meta.json`, which every process reads. `--data synthetic` runs the demo data.
 
 Which to use: the model is small (tens to hundreds of thousands of parameters), so DDP pays off only when one epoch over your data takes long. For choosing `p`, seeds or architecture, option A gives the most work per GPU hour. Notebooks always run on one GPU; DDP needs `torchrun`, so it runs through the script.
+
+## Running on Databricks
+
+* **Runtime:** use Databricks Runtime 18 LTS ML (GPU) and don't reinstall PyTorch. The code runs on PyTorch ≥ 2.1.
+* **`output_dir` on a Volume** (`/Volumes/...`), `/dbfs/...` or `/Workspace/...`: these locations don't support appending to a file or out-of-order writes (zip files such as `torch.save` checkpoints). The trainer detects such paths and writes logs, metrics and checkpoints on the local disk first (`/local_disk0/tmp/...`). It then copies each finished file to `output_dir` in one write (`TrainConfig.local_staging="auto"`, `staging_dir`).
+* **Large data:** keep `x` as float32 and `state` as uint8, preprocess in place or from memory-mapped files (notebook 05), and let the trainer stream batches to the GPU.
+* **Debugging a CUDA error:** set `os.environ["CUDA_LAUNCH_BLOCKING"] = "1"` in a fresh Python process before the first GPU use (`dbutils.library.restartPython()` first). The traceback then points at the operation that failed. Remove it afterwards, because it slows training a lot.
 
 ## Code review: what was wrong in the first draft and is now fixed
 

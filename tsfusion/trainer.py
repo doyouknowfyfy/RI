@@ -16,6 +16,7 @@ Per epoch
 from __future__ import annotations
 
 import csv
+import hashlib
 import inspect
 import json
 import logging
@@ -23,7 +24,9 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
+import tempfile
 import time
 import warnings
 from typing import Dict, Optional, Tuple
@@ -85,8 +88,38 @@ def resolve_device(name: str) -> torch.device:
     return dev
 
 
-def _make_logger(output_dir: str, verbose: bool, enabled: bool = True) -> logging.Logger:
-    logger = logging.getLogger(f"tsfusion.{os.path.abspath(output_dir)}")
+# Mounted cloud storage on Databricks (Unity Catalog Volumes, DBFS, workspace files) does not
+# support appending to a file or writing out of order (zip files such as torch.save
+# checkpoints). Files for such an output_dir are written on local disk and copied over whole.
+_NO_APPEND_PREFIXES = ("/Volumes/", "/dbfs/", "/Workspace/")
+
+
+def needs_local_staging(output_dir: str, mode="auto") -> bool:
+    if mode == "auto":
+        return os.path.abspath(output_dir).startswith(_NO_APPEND_PREFIXES)
+    return bool(mode)
+
+
+def _default_staging_dir(output_dir: str) -> str:
+    base = "/local_disk0/tmp" if os.path.isdir("/local_disk0") else tempfile.gettempdir()
+    tag = hashlib.md5(os.path.abspath(output_dir).encode()).hexdigest()[:12]
+    return os.path.join(base, "tsfusion_staging", tag)
+
+
+def _enable_tf32() -> None:
+    """TF32 matmuls / convolutions on Ampere+ GPUs (new API from PyTorch 2.9, old before)."""
+    if hasattr(torch.backends.cuda.matmul, "fp32_precision") and \
+            hasattr(getattr(torch.backends.cudnn, "conv", None), "fp32_precision"):
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+    else:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def _make_logger(log_dir: str, verbose: bool, enabled: bool = True,
+                 name: Optional[str] = None) -> logging.Logger:
+    logger = logging.getLogger(f"tsfusion.{os.path.abspath(name or log_dir)}")
     logger.setLevel(logging.INFO)
     logger.propagate = False
     for h in list(logger.handlers):          # avoid duplicate handlers when re-running cells
@@ -96,7 +129,7 @@ def _make_logger(output_dir: str, verbose: bool, enabled: bool = True) -> loggin
         logger.addHandler(logging.NullHandler())
         return logger
     fmt = logging.Formatter("%(asctime)s | %(message)s", "%H:%M:%S")
-    fh = logging.FileHandler(os.path.join(output_dir, "train.log"))
+    fh = logging.FileHandler(os.path.join(log_dir, "train.log"))
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     if verbose:
@@ -198,8 +231,7 @@ class Trainer:
             self.amp_dtype = torch.float16
         self.scaler = _grad_scaler(enabled=self.use_amp and self.amp_dtype == torch.float16)
         if self.device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+            _enable_tf32()
 
         self.optimizer = torch.optim.AdamW(_param_groups(self.model, train_cfg.weight_decay),
                                            lr=train_cfg.lr)
@@ -211,8 +243,19 @@ class Trainer:
         self._best_state: Optional[Dict[str, torch.Tensor]] = None   # in-memory best weights
         self._resume_scheduler_state = None
 
-        os.makedirs(train_cfg.output_dir, exist_ok=True)
-        self.logger = _make_logger(train_cfg.output_dir, train_cfg.verbose, enabled=self.is_main)
+        # files are written in `work_dir`; with local staging (output_dir on a Volume / DBFS)
+        # that is a local directory and every finished file is copied to output_dir
+        out = train_cfg.output_dir
+        self.staging = needs_local_staging(out, train_cfg.local_staging)
+        self.work_dir = (train_cfg.staging_dir or _default_staging_dir(out)) if self.staging else out
+        os.makedirs(out, exist_ok=True)
+        os.makedirs(self.work_dir, exist_ok=True)
+        if self.staging and self.is_main and os.path.exists(os.path.join(out, "train.log")):
+            shutil.copyfile(os.path.join(out, "train.log"), os.path.join(self.work_dir, "train.log"))
+        self.logger = _make_logger(self.work_dir, train_cfg.verbose, enabled=self.is_main, name=out)
+        if self.staging:
+            self.logger.info(f"output_dir {out} does not support appends: writing files in "
+                             f"{self.work_dir} and copying each finished file to output_dir")
 
     # ------------------------------------------------------------------ helpers
     def _data_on_gpu(self, *datasets: ProcessedData) -> bool:
@@ -387,13 +430,37 @@ class Trainer:
                 ckpt["scheduler_state"] = self.scheduler.state_dict()
         return ckpt
 
+    def _publish(self, name: str, remove_local: bool = False) -> None:
+        """Local staging: copy a finished file from work_dir to output_dir in one sequential
+        write (what Volumes / DBFS support). No-op without staging."""
+        if not (self.staging and self.is_main):
+            return
+        if name == "train.log":
+            for h in self.logger.handlers:
+                h.flush()
+        src = os.path.join(self.work_dir, name)
+        shutil.copyfile(src, os.path.join(self.cfg.output_dir, name))
+        if remove_local:
+            os.remove(src)
+
+    def _save_ckpt(self, name: str, ckpt: dict) -> None:
+        local = os.path.join(self.work_dir, name)
+        torch.save(ckpt, local + ".tmp")
+        os.replace(local + ".tmp", local)     # never leaves a half-written local checkpoint
+        self._publish(name, remove_local=True)
+
     def save_checkpoint(self, path: str, epoch: int, metrics: Dict[str, float],
                         with_optimizer: bool = True) -> None:
+        """Save a checkpoint. A bare file name (e.g. ``"epoch_003.pt"``) goes to output_dir
+        (through local staging when needed); a path with a directory is written there."""
         if not self.is_main:                 # weights are identical on all ranks
             return
-        tmp = path + ".tmp"
-        torch.save(self._checkpoint(epoch, metrics, with_optimizer), tmp)
-        os.replace(tmp, path)          # atomic: never leaves a half-written checkpoint
+        ckpt = self._checkpoint(epoch, metrics, with_optimizer)
+        if os.path.dirname(path):
+            torch.save(ckpt, path + ".tmp")
+            os.replace(path + ".tmp", path)
+        else:
+            self._save_ckpt(path, ckpt)
 
     def resume(self, path: str) -> int:
         """Restore model / optimizer / scheduler from a per-epoch checkpoint; returns the
@@ -430,9 +497,10 @@ class Trainer:
             if best is not None:
                 for k in ("optimizer_state", "scaler_state", "scheduler_state"):
                     best.pop(k, None)
-                torch.save(best, os.path.join(out, "best_model.pt"))  # consistent with resume
-            if hist is not None:
-                hist.to_csv(hist_path, index=False)    # drop rows after the resumed epoch
+                self._save_ckpt("best_model.pt", best)        # consistent with the resume
+            if hist is not None:                              # drop rows after the resumed epoch
+                hist.to_csv(os.path.join(self.work_dir, "metrics.csv"), index=False)
+                self._publish("metrics.csv")
         barrier()
         return epoch + 1
 
@@ -450,6 +518,10 @@ class Trainer:
                 os.remove(os.path.join(out, f))
             if stale:
                 self.logger.info(f"removed {len(stale)} files of a previous run in {out}")
+            if self.staging:                  # leftovers of an earlier run in the local copy
+                for f in os.listdir(self.work_dir):
+                    if re.fullmatch(r"epoch_\d+\.pt(\.tmp)?|best_model\.pt(\.tmp)?|metrics\.csv", f):
+                        os.remove(os.path.join(self.work_dir, f))
         barrier()
 
     # ------------------------------------------------------------------ main loop
@@ -481,11 +553,12 @@ class Trainer:
                                                 replace=False))
 
         if self.is_main:
-            with open(os.path.join(cfg.output_dir, "config.json"), "w") as f:
+            with open(os.path.join(self.work_dir, "config.json"), "w") as f:
                 json.dump({"model": self.model_cfg.to_dict(), "train": cfg.to_dict(),
                            "n_gpus": self.world_size,
                            "target_scaler": self.prep.target_scaler.state_dict()}, f, indent=2)
-        csv_path = os.path.join(cfg.output_dir, "metrics.csv")
+            self._publish("config.json")
+        csv_path = os.path.join(self.work_dir, "metrics.csv")
 
         amp = str(self.amp_dtype).split('.')[-1] if self.use_amp else "off"
         gpus = (f"gpus={self.world_size} (DDP, global batch {cfg.batch_size * self.world_size}) "
@@ -536,13 +609,13 @@ class Trainer:
             self.history.append(row)
             if self.is_main:
                 self._append_csv(csv_path, row)
+                self._publish("metrics.csv")
 
             if cfg.save_every_epoch:
-                self.save_checkpoint(os.path.join(cfg.output_dir, f"epoch_{epoch:03d}.pt"),
-                                     epoch, row, with_optimizer=cfg.save_optimizer_state)
+                self.save_checkpoint(f"epoch_{epoch:03d}.pt", epoch, row,
+                                     with_optimizer=cfg.save_optimizer_state)
             if improved:
-                self.save_checkpoint(os.path.join(cfg.output_dir, "best_model.pt"), epoch, row,
-                                     with_optimizer=False)
+                self.save_checkpoint("best_model.pt", epoch, row, with_optimizer=False)
 
             self.logger.info(
                 f"epoch {epoch:3d} | lr {lr:.2e} | train loss {train_loss:.4f} "
@@ -551,6 +624,7 @@ class Trainer:
                 f"rmse {val_m['rmse']:.4f} mae {val_m['mae']:.4f} r2 {val_m['r2']:.4f} "
                 f"nmad {val_m['nmad']:.4f} | {'*best*' if improved else f'{bad_epochs} bad'} "
                 f"| {row['epoch_time_s']:.1f}s")
+            self._publish("train.log")
 
             if bad_epochs >= cfg.early_stopping_patience:
                 self.logger.info(f"early stopping at epoch {epoch}: no improvement in val RMSE "
@@ -565,6 +639,7 @@ class Trainer:
                              f"(val RMSE {self.best_metric:.4f})")
         else:
             warnings.warn("validation RMSE was never finite - keeping the last weights")
+        self._publish("train.log")
         return pd.DataFrame(self.history)
 
     @staticmethod

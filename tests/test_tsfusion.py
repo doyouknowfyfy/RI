@@ -517,3 +517,49 @@ def test_attention_split_into_slices_matches_single_call(synth, raw_splits, fusi
     from tsfusion.interpret import run_with_attention
     _, _, _, maps = run_with_attention(model, d.x[b], d.state[b], d.snapshot[b])
     assert maps.time[0].shape[0] == 12 and torch.allclose(maps.time[0].sum(-1), torch.ones(()), atol=1e-5)
+
+
+# ----------------------------------------------------------------------------- Volumes / DBFS output
+def test_local_staging_never_appends_to_output_dir(tmp_path, synth, raw_splits, monkeypatch):
+    """Unity Catalog Volumes / DBFS reject appends and out-of-order (zip) writes. With
+    local staging every file is written locally and copied over whole."""
+    import builtins
+    from tsfusion.trainer import needs_local_staging
+    assert needs_local_staging("/Volumes/cat/sch/vol/runs") and needs_local_staging("/dbfs/x")
+    assert needs_local_staging("/Workspace/Users/a/runs") and not needs_local_staging("runs/x")
+    out, stage = str(tmp_path / "volume_out"), str(tmp_path / "local_stage")
+    real_open, real_save = builtins.open, torch.save
+
+    def guarded_open(file, mode="r", *a, **k):
+        if str(file).startswith(out) and ("a" in mode or "+" in mode):
+            raise OSError(29, "Illegal seek")
+        return real_open(file, mode, *a, **k)
+
+    def guarded_save(obj, f, *a, **k):
+        assert not str(f).startswith(out), f"torch.save straight into output_dir: {f}"
+        return real_save(obj, f, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(torch, "save", guarded_save)
+    train, val = raw_splits
+    mcfg = _model_cfg(synth)
+    prep = Preprocessor(3, mcfg.snapshot_group_sizes).fit(train)
+    tr, va = prep.transform(train), prep.transform(val)
+    cfg = dict(batch_size=128, max_epochs=2, device="cpu", verbose=False, output_dir=out,
+               local_staging=True, staging_dir=stage)
+    t1 = Trainer(mcfg, TrainConfig(**cfg), prep)
+    assert t1.logger.handlers[0].baseFilename.startswith(stage)
+    t1.fit(tr, va)
+    files = set(os.listdir(out))
+    assert {"epoch_001.pt", "epoch_002.pt", "best_model.pt", "metrics.csv", "train.log",
+            "config.json"} <= files
+    assert not [f for f in os.listdir(stage) if f.endswith(".pt")]      # copied, then removed
+    t2 = Trainer(mcfg, TrainConfig(**{**cfg, "max_epochs": 3}), prep)
+    start = t2.resume(os.path.join(out, "epoch_001.pt"))
+    t2.fit(tr, va, start_epoch=start)
+    monkeypatch.setattr(builtins, "open", real_open)
+    assert pd.read_csv(os.path.join(out, "metrics.csv"))["epoch"].tolist() == [1, 2, 3]
+    log = open(os.path.join(out, "train.log")).read()
+    assert log.count(" | epoch ") == 4                # 2 epochs + 2 after the resume, one file
+    _, _, _, ck = load_checkpoint(os.path.join(out, "best_model.pt"))
+    assert ck["epoch"] in (1, 2, 3)
