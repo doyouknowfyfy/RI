@@ -462,6 +462,50 @@ class Trainer:
         else:
             self._save_ckpt(path, ckpt)
 
+    @classmethod
+    def from_checkpoint(cls, path: str, resume: bool = True, device: Optional[str] = None,
+                        **train_overrides) -> Tuple["Trainer", Preprocessor, int]:
+        """Rebuild a trainer from a checkpoint, with the model config, training config and
+        fitted preprocessor stored in it. Returns ``(trainer, preprocessor, start_epoch)``.
+
+        ``resume=True``  - continue the SAME run from an ``epoch_XXX.pt`` checkpoint: weights,
+                           optimizer, LR schedule, best model so far, metrics history and the
+                           early-stopping counter are restored; files go to the same
+                           output_dir. Raise ``max_epochs`` (and ``early_stopping_patience`` if
+                           the run had stopped early) through ``train_overrides``.
+        ``resume=False`` - start a NEW run from the checkpoint's weights (e.g. ``best_model.pt``
+                           for fine-tuning): fresh optimizer and schedule, epoch 1, and a
+                           different ``output_dir`` is required so the old run's files stay.
+
+        Transform the data with the returned preprocessor (do not refit it), then call
+        ``trainer.fit(train, val, start_epoch=start_epoch)``.
+        """
+        ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        model_cfg = ModelConfig(**ckpt["model_config"])
+        overrides = dict(train_overrides)
+        if device is not None:
+            overrides["device"] = device
+        train_cfg = TrainConfig(**{**ckpt["train_config"], **overrides})
+        prep = Preprocessor.from_state_dict(ckpt["preprocessor"])
+        if resume:
+            if "optimizer_state" not in ckpt:
+                raise ValueError(f"{path} has no optimizer state (best_model.pt never has): resume "
+                                 "from an epoch_XXX.pt checkpoint, or use resume=False to start a "
+                                 "new run from these weights")
+            trainer = cls(model_cfg, train_cfg, prep)
+            start = trainer.resume(path)
+            if start > train_cfg.max_epochs:
+                warnings.warn(f"checkpoint is at epoch {start - 1} but max_epochs="
+                              f"{train_cfg.max_epochs}: pass max_epochs=... to train further")
+            return trainer, prep, start
+        same_dir = os.path.abspath(train_cfg.output_dir) == os.path.abspath(os.path.dirname(path))
+        if same_dir:
+            raise ValueError("resume=False starts a new run, which would clear the checkpoints in "
+                             f"{train_cfg.output_dir}: pass a different output_dir=...")
+        model = TSFusionTransformer(model_cfg)
+        model.load_state_dict(ckpt["model_state"])
+        return cls(model_cfg, train_cfg, prep, model=model), prep, 1
+
     def resume(self, path: str) -> int:
         """Restore model / optimizer / scheduler from a per-epoch checkpoint; returns the
         epoch to start from. Call before ``fit(..., start_epoch=...)``."""

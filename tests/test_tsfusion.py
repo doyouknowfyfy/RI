@@ -563,3 +563,42 @@ def test_local_staging_never_appends_to_output_dir(tmp_path, synth, raw_splits, 
     assert log.count(" | epoch ") == 4                # 2 epochs + 2 after the resume, one file
     _, _, _, ck = load_checkpoint(os.path.join(out, "best_model.pt"))
     assert ck["epoch"] in (1, 2, 3)
+
+
+# ----------------------------------------------------------------------------- continue training
+def test_from_checkpoint_continue_and_finetune(tmp_path, synth, raw_splits):
+    train, val = raw_splits
+    mcfg = _model_cfg(synth, missing_fusion="late")
+    out = str(tmp_path / "run1")
+    prep = Preprocessor(3, mcfg.snapshot_group_sizes, target_mode="mean_scale").fit(train)
+    tr, va = prep.transform(train), prep.transform(val)
+    Trainer(mcfg, TrainConfig(loss="tweedie", batch_size=128, max_epochs=2, scheduler="cosine",
+                              device="cpu", verbose=False, output_dir=out), prep).fit(tr, va)
+
+    # 1) continue the same run: epochs 3-4 in the same folder, with the stored configs
+    t, p2, start = Trainer.from_checkpoint(os.path.join(out, "epoch_002.pt"), max_epochs=4)
+    assert start == 3 and t.cfg.loss == "tweedie" and t.model_cfg.missing_fusion == "late"
+    assert t.cfg.max_epochs == 4 and t.cfg.scheduler == "cosine"
+    np.testing.assert_allclose(p2.ts_mean, prep.ts_mean)               # fitted stats restored
+    hist = t.fit(p2.transform(train), p2.transform(val), start_epoch=start)
+    assert hist["epoch"].tolist() == [1, 2, 3, 4]
+    assert pd.read_csv(os.path.join(out, "metrics.csv"))["epoch"].tolist() == [1, 2, 3, 4]
+
+    # 2) new run from the best weights (fine-tuning): fresh optimizer, epoch 1, new folder
+    best = os.path.join(out, "best_model.pt")
+    with pytest.raises(ValueError, match="no optimizer state"):
+        Trainer.from_checkpoint(best)                                   # resume needs epoch_XXX.pt
+    with pytest.raises(ValueError, match="different output_dir"):
+        Trainer.from_checkpoint(best, resume=False)                     # would clear run1
+    ft, p3, start = Trainer.from_checkpoint(best, resume=False, lr=1e-4, max_epochs=1,
+                                            output_dir=str(tmp_path / "finetune"))
+    m_best, _, _, _ = load_checkpoint(best)
+    vb = p3.transform(val)
+    ft.model.eval()                                                     # no dropout for the check
+    with torch.no_grad():
+        assert torch.allclose(ft.model.cpu()(vb.x[:8], vb.state[:8], vb.snapshot[:8]),
+                              m_best(vb.x[:8], vb.state[:8], vb.snapshot[:8]), atol=1e-6)
+    assert start == 1 and ft.cfg.lr == 1e-4 and ft.global_step == 0
+    ft.fit(p3.transform(train), vb, start_epoch=start)
+    assert os.path.exists(os.path.join(tmp_path, "finetune", "best_model.pt"))
+    assert os.path.exists(best)                                         # old run untouched

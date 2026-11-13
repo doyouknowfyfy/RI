@@ -37,7 +37,7 @@ tsfusion/
   viz.py        matplotlib figures for interpret results (state-aware colours and glyphs)
   synthetic.py  synthetic data in the same layout as the real data
 scripts/        train.py (command line, one GPU or torchrun) and run_grid.sh (one experiment per GPU)
-tests/          pytest suite (63 tests incl. 2-process DDP, attention rollout, combined-state, memory and no-append-storage checks, CPU, about 1 min)
+tests/          pytest suite (64 tests incl. 2-process DDP, attention rollout, combined-state, memory and no-append-storage checks, CPU, about 1 min)
 notebooks/      the three demo notebooks
 ```
 
@@ -78,6 +78,25 @@ y_new = predict_with(model, prep, cfg, prep.transform(new_raw))
 ```
 
 `long_df_to_array` / `wide_df_to_array` build the `(N, T, V)` arrays from long `(record_id, time_step) × variables` frames or from wide `var_t1 … var_t11` frames. `encode_special_values(x_raw, {-999: 1, -998: 2}, special_flag)` turns sentinel values into codes.
+
+### Continuing training from a checkpoint
+
+Every checkpoint stores the model config, the training config and the fitted preprocessor, so `Trainer.from_checkpoint` rebuilds everything:
+
+```python
+# a) continue the SAME run (epoch_XXX.pt holds optimizer + schedule state), same output_dir
+trainer, prep, start = Trainer.from_checkpoint("runs/exp1/epoch_020.pt",
+                                               max_epochs=50, early_stopping_patience=15)
+# b) NEW run from trained weights (e.g. fine-tuning best_model.pt): fresh optimizer, new folder
+trainer, prep, start = Trainer.from_checkpoint("runs/exp1/best_model.pt", resume=False,
+                                               lr=2e-4, max_epochs=10, output_dir="runs/exp1_ft")
+
+train = prep.transform(train_raw, inplace=True)       # the checkpoint's preprocessor: do not refit
+val = prep.transform(val_raw, inplace=True)
+history = trainer.fit(train, val, start_epoch=start)
+```
+
+Any `TrainConfig` field can be overridden as a keyword argument; everything else is taken from the checkpoint.
 
 ## How the requirements map to the code
 
